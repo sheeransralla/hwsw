@@ -3,3 +3,4 @@ pyflate/venv/
 *.prof
 *.folded
 tools/FlameGraph/
+.DS_Store

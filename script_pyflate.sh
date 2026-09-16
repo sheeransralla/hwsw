@@ -46,6 +46,7 @@ PYTHON_DBG="${PYTHON_DBG:-python3-dbg}"
 
 MODE="${MODE:-}"                    # "", --fast or --rigorous
 PERF_FREQ="${PERF_FREQ:-999}"       # sampling frequency (Hz)
+PERF_EVENT="${PERF_EVENT:-cpu-clock}" # sampling event (cycles needs a PMU)
 PROFILE_LOOPS="${PROFILE_LOOPS:-5}" # decompressions per profiling run
 
 # ----------------------------------------------------------------------------
@@ -190,14 +191,17 @@ profile_one() {
     echo "Written $RESULTS/cprofile_$label.txt"
 
     log "[$label] perf record with $PYTHON_DBG ($PROFILE_LOOPS loops, ${PERF_FREQ} Hz)"
-    local event=()
-    if perf stat -e cycles true 2>&1 | grep -qi "not supported\|not counted"; then
-        echo "Hardware 'cycles' event unavailable (common in VMs); using cpu-clock"
-        event=(-e cpu-clock)
-    fi
-    perf record "${event[@]}" -F "$PERF_FREQ" -g \
+    # cpu-clock is a timer-based software event. It works in VMs that do not
+    # expose a hardware PMU, where the "cycles" event records no samples.
+    perf record -e "$PERF_EVENT" -F "$PERF_FREQ" -g \
         -o "$RESULTS/perf_$label.data" -- \
         "$PYTHON_DBG" "$DRIVER" --bench-dir "$bench_dir" --loops "$PROFILE_LOOPS"
+
+    local samples
+    samples="$(perf report -i "$RESULTS/perf_$label.data" --stdio 2>/dev/null \
+        | awk '/^# Samples:/ && !found {print $3; found = 1}' || true)"
+    echo "perf samples recorded: ${samples:-0}"
+    [[ "${samples:-0}" != "0" ]] || die "perf recorded no samples; try PERF_EVENT=cpu-clock"
 
     log "[$label] perf reports"
     # Call-graph view (Children = time including callees), as in the course guide.
