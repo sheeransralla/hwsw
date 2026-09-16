@@ -1,0 +1,5 @@
+pyflate/venv/
+*.data
+*.prof
+*.folded
+tools/FlameGraph/
