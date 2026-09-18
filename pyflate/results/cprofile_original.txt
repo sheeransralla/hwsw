@@ -1,0 +1,82 @@
+=== sorted by tottime (time inside the function itself) ===
+Fri Sep 18 15:01:45 2026    /root/hwsw-project/pyflate/results/cprofile_original.prof
+
+         3185461 function calls in 2.194 seconds
+
+   Ordered by: internal time
+   List reduced from 45 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.494    0.494    2.160    2.160 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:394(decode_huffman_block)
+   148271    0.337    0.000    1.068    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:224(find_next_symbol)
+   341601    0.224    0.000    0.488    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:112(snoopbits)
+    92803    0.215    0.000    0.215    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:288(move_to_front)
+   156708    0.195    0.000    0.271    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:117(readbits)
+   655017    0.132    0.000    0.132    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:54(_mask)
+        1    0.107    0.107    0.243    0.243 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:306(bwt_reverse)
+        1    0.080    0.080    0.105    0.105 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:292(bwt_transform)
+   766811    0.076    0.000    0.076    0.000 {method 'append' of 'list' objects}
+    67562    0.072    0.000    0.171    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:106(_more)
+   674570    0.070    0.000    0.070    0.000 {built-in method builtins.len}
+    67562    0.054    0.000    0.089    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:43(_read)
+    67526    0.038    0.000    0.209    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:50(needbits)
+        2    0.028    0.014    0.028    0.014 {method 'join' of 'bytes' objects}
+    67562    0.025    0.000    0.025    0.000 {method 'read' of '_io.BufferedReader' objects}
+        1    0.023    0.023    0.023    0.023 {built-in method builtins.sorted}
+    76108    0.011    0.000    0.011    0.000 {built-in method builtins.ord}
+        1    0.004    0.004    0.019    0.019 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:355(compute_selectors_list)
+      882    0.003    0.000    0.003    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:153(reverse_bits)
+      256    0.002    0.000    0.002    0.000 {method 'find' of 'bytes' objects}
+        1    0.001    0.001    0.001    0.001 {built-in method _hashlib.openssl_md5}
+        1    0.001    0.001    2.180    2.180 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:460(bzip2_main)
+        6    0.001    0.000    0.002    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:179(__init__)
+        1    0.001    0.001    0.010    0.010 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:372(compute_tables)
+        1    0.001    0.001    2.194    2.194 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:632(bench_pyflake)
+      882    0.000    0.000    0.000    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:139(__init__)
+        6    0.000    0.000    0.003    0.001 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:192(populate_huffman_symbols)
+        6    0.000    0.000    0.000    0.000 {method 'sort' of 'list' objects}
+        6    0.000    0.000    0.000    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:210(min_max_bits)
+      882    0.000    0.000    0.000    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:148(_sort_func)
+
+
+=== sorted by cumtime (time including callees) ===
+Fri Sep 18 15:01:45 2026    /root/hwsw-project/pyflate/results/cprofile_original.prof
+
+         3185461 function calls in 2.194 seconds
+
+   Ordered by: cumulative time
+   List reduced from 45 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.001    0.001    2.194    2.194 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:632(bench_pyflake)
+        1    0.001    0.001    2.180    2.180 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:460(bzip2_main)
+        1    0.494    0.494    2.160    2.160 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:394(decode_huffman_block)
+   148271    0.337    0.000    1.068    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:224(find_next_symbol)
+   341601    0.224    0.000    0.488    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:112(snoopbits)
+   156708    0.195    0.000    0.271    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:117(readbits)
+        1    0.107    0.107    0.243    0.243 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:306(bwt_reverse)
+    92803    0.215    0.000    0.215    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:288(move_to_front)
+    67526    0.038    0.000    0.209    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:50(needbits)
+    67562    0.072    0.000    0.171    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:106(_more)
+   655017    0.132    0.000    0.132    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:54(_mask)
+        1    0.080    0.080    0.105    0.105 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:292(bwt_transform)
+    67562    0.054    0.000    0.089    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:43(_read)
+   766811    0.076    0.000    0.076    0.000 {method 'append' of 'list' objects}
+   674570    0.070    0.000    0.070    0.000 {built-in method builtins.len}
+        2    0.028    0.014    0.028    0.014 {method 'join' of 'bytes' objects}
+    67562    0.025    0.000    0.025    0.000 {method 'read' of '_io.BufferedReader' objects}
+        1    0.023    0.023    0.023    0.023 {built-in method builtins.sorted}
+        1    0.004    0.004    0.019    0.019 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:355(compute_selectors_list)
+    76108    0.011    0.000    0.011    0.000 {built-in method builtins.ord}
+        1    0.001    0.001    0.010    0.010 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:372(compute_tables)
+        6    0.000    0.000    0.003    0.001 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:192(populate_huffman_symbols)
+      882    0.003    0.000    0.003    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:153(reverse_bits)
+        6    0.000    0.000    0.002    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:248(__init__)
+        6    0.001    0.000    0.002    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:179(__init__)
+      256    0.002    0.000    0.002    0.000 {method 'find' of 'bytes' objects}
+        1    0.001    0.001    0.001    0.001 {built-in method _hashlib.openssl_md5}
+      882    0.000    0.000    0.000    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:139(__init__)
+        6    0.000    0.000    0.000    0.000 {method 'sort' of 'list' objects}
+        1    0.000    0.000    0.000    0.000 /root/hwsw-project/pyflate/bm_pyflate/run_benchmark.py:336(compute_used)
+
+

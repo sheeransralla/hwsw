@@ -1,0 +1,13 @@
+=== pyperf compare_to (baseline -> optimized) ===
++-----------+----------+----------------------+
+| Benchmark | baseline | optimized            |
++===========+==========+======================+
+| pyflate   | 1.12 sec | 397 ms: 2.83x faster |
++-----------+----------+----------------------+
+
+=== summary ===
+baseline :   1122.7 ms +- 13.4 ms (120 values)
+optimized:    396.7 ms +- 3.9 ms (120 values)
+time reduction: 64.7 %
+speedup       : 2.83x
+target (course): at least 7 % improvement -> met
