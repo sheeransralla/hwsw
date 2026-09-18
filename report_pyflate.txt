@@ -1,0 +1,1323 @@
+================================================================================
+                    HWSW PROJECT - BENCHMARK REPORT: PYFLATE
+================================================================================
+
+Benchmark : pyflate (pyperformance, bm_pyflate/run_benchmark.py)
+Author    : Paul Sladen (2006-2007), pure-Python DEFLATE/bzip2 decoder
+Input     : data/interpreter.tar.bz2
+
+Contents
+  1. Overview
+  2. Initial Analysis                  (TODO)
+  3. Optimizations                     (TODO)
+  4. Performance Comparison            (TODO)
+  5. Hardware Acceleration Proposal    (TODO)
+  6. Conclusion                        (TODO)
+
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+1.1 Purpose of the benchmark
+----------------------------
+pyflate evaluates how efficiently CPython executes a pure-Python implementation
+of a real decompression algorithm. The benchmark decompresses a bzip2 archive
+without delegating any part of the decoding to a native compression library
+such as bz2 or zlib; every decompression stage is implemented directly in the
+benchmark's Python source. The workload is CPU-bound and single-threaded, so it
+measures the cost of the interpreter itself rather than of optimized native code.
+
+The workload exercises several common forms of algorithmic Python processing:
+  - integer and bit manipulation (shifts and masks on an arbitrary-precision
+    int used as a bit buffer),
+  - frequent method calls and attribute accesses,
+  - tight Python loops executed hundreds of thousands of times per run,
+  - list slicing, concatenation and rearrangement,
+  - creation and joining of many small bytes objects,
+  - table construction and variable-length (Huffman) symbol lookup.
+
+These operations resemble the work performed by parsers, codecs and protocol
+decoders implemented without native extensions. pyflate is therefore useful for
+studying the performance of interpreter-executed algorithms and for identifying
+operations that could benefit from software optimization or hardware
+acceleration.
+
+The source contains decoders for both gzip (DEFLATE) and bzip2. The benchmark
+input, interpreter.tar.bz2, begins with the "BZ" signature, so bench_pyflake()
+dispatches to bzip2_main(). Consequently gzip_main(), the LSB-first Bitfield
+reader and the DEFLATE-specific helper functions are never executed for this
+workload, and the analysis focuses on the bzip2 execution path.
+
+
+1.2 Input workload (measured)
+-----------------------------
+The input is a bzip2 archive of a tar file containing 25 Python source files of
+the PyPy interpreter (argument.py, baseobjspace.py, eval.py, function.py, ...).
+All values below are deterministic: they depend only on the input file, not on
+the machine or Python version. They were collected by instrumenting the decoder
+(see characterize_pyflate.py).
+
+    Compressed input size .................... 67,562 bytes
+    Decompressed output size ................. 399,360 bytes (ratio ~5.9:1)
+    Distinct byte values used in the block ... 145
+    Block size level ......................... 9 (900 kB blocks)
+    Number of bzip2 blocks ................... 1
+    Huffman tables (groups) .................. 6
+    Huffman symbol alphabet size ............. 147 (see note below)
+    Huffman code lengths ..................... 2 to 15 bits
+    Selectors (one per 50 symbols) ........... 2,966
+    Huffman symbols decoded .................. 148,271
+    Table entries scanned during decoding .... 883,623 (avg 6.0 per symbol)
+    Run symbols (RUNA/RUNB) .................. 58,433 (34,664 runs,
+                                                   246,347 bytes)
+    Byte move-to-front operations ............ 89,837 (avg index 7.2)
+    Selector move-to-front operations ........ 2,966 (avg index 1.2)
+    Single-byte file reads (_more calls) ..... 67,562
+    Inverse-BWT input/output size ............ 336,184 bytes (336,184 steps)
+    RLE1 expansion input size ................ 336,184 bytes
+    RLE1 expansion loop iterations ........... 302,016 (8,542 runs expanded)
+    RLE1 expansion output size ............... 399,360 bytes
+
+Alphabet note: the composition of the 147-symbol Huffman alphabet is
+explained in 1.5(c).
+
+One benchmark loop decompresses the entire archive once. After all timed loops
+of a bench_pyflake() call finish, the benchmark checks the MD5 digest of the
+final output; this check is outside the measured time.
+
+
+1.3 Libraries and dependencies
+------------------------------
+
+Standard library:
+
+  struct   - int2byte = struct.Struct(">B").pack converts an integer
+             from 0 to 255 into a one-byte bytes object. The decoder
+             uses it when building the move-to-front alphabet and
+             during inverse-BWT preparation.
+
+  hashlib  - Computes the MD5 digest of the decompressed output and
+             compares it with the expected digest:
+             afa004a630fe072901b1d9628b960974.
+             This check occurs after the timed loops, outside the
+             measured time.
+
+  os       - Uses os.path.dirname() and os.path.join() to locate
+             data/interpreter.tar.bz2 relative to the script.
+
+Third-party libraries:
+
+  pyperf   - Provides the measurement harness. A pyperf.Runner
+             registers bench_pyflake() through bench_time_func().
+             The runner spawns several worker processes, performs
+             warmup runs, calibrates the number of loops, and calls
+             bench_pyflake(loops, filename). That function measures
+             elapsed time with pyperf.perf_counter() and returns it
+             to the harness, which reports the mean and standard
+             deviation across runs. pyperf does not implement any
+             part of the decompression algorithm.
+
+  pyperformance
+           - The benchmark suite that packages bm_pyflate. It creates
+             an isolated virtual environment, installs the benchmark's
+             dependencies (pyperf), and launches run_benchmark.py.
+
+The decoder does not call a compression library such as bz2 or zlib.
+Its bitstream parsing and bzip2 decoding logic are written in Python.
+Some operations invoked by that Python code have native
+implementations, including built-ins (sorted(), bytes.join(), list
+slicing), file reads, and struct.pack().
+
+
+1.4 Program structure and execution flow
+----------------------------------------
+The benchmark opens the compressed file once. Each timed loop rewinds that file
+and decompresses it in full.
+
+  bench_pyflake(loops, filename)
+    open(filename, 'rb')                   before timing starts
+    start timer
+
+    repeat loops times:
+      input_fp.seek(0)                     rewind the open file
+      field = RBitfield(input_fp)
+      field.readbits(16)                   identify the "BZ" signature
+      bzip2_main(field)
+        RBitfield(field)                   copy constructor; continues the
+                                           same bitstream (see 1.8)
+        readbits(8) twice                  'h' method byte and block size
+
+        for each bzip2 block:
+          readbits(48)                     block or end-of-stream marker
+          readbits(32)                     CRC, read but not verified
+
+          if data-block marker:
+            decode_huffman_block(b, out)
+              readbits(1)                  randomised-block flag
+              readbits(24)                 original BWT pointer (origPtr)
+              compute_used(b)              byte values used in the block
+              readbits(3)                  number of Huffman tables (2..6)
+              compute_selectors_list()     Huffman-table selectors
+              compute_tables()             canonical Huffman tables
+
+              repeat until EOB symbol:
+                every 50 symbols: switch table via next selector
+                find_next_symbol()
+                  snoopbits() / readbits()
+                    needbits() -> _more() -> _read() -> file.read(1)
+                RUNA/RUNB: accumulate run of the front MTF byte
+                other symbols: move_to_front() and emit the byte
+
+              bwt_reverse()                invert the BWT permutation
+                bwt_transform()            build the BWT reversal mapping T
+              final RLE1 expansion         expand 4-byte runs + count byte
+
+          if end-of-stream marker:
+            align to a byte boundary and stop
+
+        b''.join(out)                      assemble decompressed output
+
+    stop timer
+    close input file
+    verify MD5 of the final output         outside the timed interval
+
+gzip_main() is called only when the file begins with the gzip signature
+(0x1F8B). The supplied .bz2 archive follows the bzip2 path above. The decoder
+also checks some header and symbol values, but it does not verify the bzip2
+CRCs. The MD5 digest checks only the decompressed output of the last timed loop.
+
+
+1.5 Algorithms
+--------------
+bzip2 compression applies, in order: RLE1 -> BWT -> MTF -> RLE2 (RUNA/RUNB) ->
+Huffman coding. The decoder undoes these stages in reverse order.
+
+(a) Bitstream reading - RBitfield
+
+    Why it is needed: bzip2 data is not organised in whole bytes. Huffman
+    codes in this file are 2 to 15 bits long, and header fields have sizes
+    such as 1, 3, 15, 24 or 48 bits. The decoder therefore needs a reader
+    that can return an arbitrary number of bits from the byte stream.
+
+    Bit order: bzip2 is most-significant-bit (MSB) first. The first bit of
+    the stream is the highest bit of the first byte, and bits are read from
+    left to right as they appear when the bytes are written in binary.
+
+    State: RBitfield keeps two values:
+      bitfield - a Python integer holding the bits that were read from the
+                 file but not yet consumed. The oldest (next) bit is the
+                 highest valid bit; newly read bytes are added at the low end.
+      bits     - how many bits of "bitfield" are valid.
+
+    Operations:
+      _more()        reads one byte and appends it below the existing bits:
+                     bitfield = (bitfield << 8) + byte;  bits += 8
+      needbits(n)    calls _more() repeatedly until at least n bits are valid.
+      snoopbits(n)   returns the next n bits without consuming them:
+                     (bitfield >> (bits - n)) & (2^n - 1)
+      readbits(n)    returns the same value, then consumes it: bits -= n, and
+                     the returned bits are cleared from the top of bitfield.
+
+    Example: suppose 3 unread bits "101" are buffered and the decoder asks
+    for 6 bits.
+      1. Only 3 bits are valid, so _more() reads the byte 0xC3 = 11000011:
+             bitfield = 101 11000011   (bits = 11)
+      2. readbits(6) takes the top 6 bits:
+             101110 = 46               returned value
+      3. The 6 consumed bits are cleared from the top of bitfield.
+
+    After the read, bitfield has the integer value 3 (binary "11").
+    Because bits = 5, its five valid bits are interpreted as "00011".
+    The next call continues from those bits, so no bits are lost or
+    repeated across byte boundaries.
+
+    Implementation cost: when more bits are needed, needbits() calls
+    _more() -> _read(1) -> file.read(1) for each new byte. Our
+    instrumentation counted 67,562 such one-byte reads per
+    decompression. The frequent Python method calls and integer
+    operations are candidates for profiling; their contribution to
+    runtime must be measured.
+
+(b) Stream and block headers - bzip2_main
+
+    The file begins with "BZ", which bench_pyflake() reads to identify it
+    as bzip2. bzip2_main() then reads 'h' to confirm the compression method
+    (Huffman coding) and a digit from '1' to '9' giving the block size in
+    units of 100,000 bytes. The limit applies to the data entering the BWT
+    stage, not to the final decompressed output. For this input the digit
+    is '9', so each block holds at most 900,000 bytes; the file contains a
+    single block of 336,184 bytes.
+
+    Next, the decoder repeatedly reads a 48-bit marker followed by a 32-bit
+    CRC:
+      0x314159265359  data block; the CRC covers that block, and the block
+                      is passed to decode_huffman_block().
+      0x177245385090  end of stream; the CRC is the combined CRC of all
+                      blocks. The decoder aligns to a byte boundary and stops.
+
+    The markers are the digits of pi (3.14159265359) and sqrt(pi)
+    (1.77245385090) written as hexadecimal digits. bzip2 blocks are not
+    byte-aligned: each block starts at whatever bit position the previous
+    one ended. A long, distinctive 48-bit pattern makes block boundaries
+    recognisable and very unlikely to appear by chance. Any other marker
+    value stops decoding with an error.
+
+    Pyflate consumes the CRC values but does not compare them with
+    calculated CRCs. It checks some header and symbol values while
+    decoding, and the MD5 digest checks only the decompressed output of
+    the last timed loop.
+
+(c) Symbol map - compute_used
+
+    The block header records which byte values actually occur in the block,
+    so the move-to-front list and the Huffman alphabet contain only those
+    bytes. This keeps the tables small and the codes short.
+
+    The 256 possible byte values are divided into 16 groups of 16. A 16-bit
+    mask identifies which groups contain used bytes. For each marked group,
+    another 16-bit mask identifies the individual bytes. compute_used()
+    returns a list of 256 booleans. It runs once per block.
+
+    The used bytes, in ascending byte-value order, form the initial
+    move-to-front list ("favourites"). For this input, 145 byte values are
+    used. The Huffman alphabet therefore has 147 symbols: RUNA and RUNB,
+    144 symbols for MTF indices 1 through 144, and one end-of-block (EOB)
+    symbol. MTF index 0 means "the byte at the front of the list again",
+    i.e. a repeat of the previous byte; repeats are coded as runs using
+    RUNA/RUNB (see (h)) instead of having their own symbol.
+
+(d) Table selectors - compute_selectors_list
+
+    Different parts of a block have different byte statistics, so bzip2
+    does not use a single Huffman table for the whole block. Instead, each
+    block defines between 2 and 6 tables (a 3-bit count read just before
+    this step), and each group of up to 50 encoded symbols is coded with
+    whichever table suits it best.
+
+    The stream provides a 15-bit count of selectors, one per group. Each
+    selector is encoded as a run of 1-bits terminated by a 0-bit. The
+    number of 1-bits gives an index into a move-to-front list of table IDs.
+    The decoder selects the table at that index and moves its ID to the
+    front of the list.
+
+    Example: with the list [0,1,2,3,4,5], the bits "110" give index 2, so
+    table 2 is selected and the list becomes [2,0,1,3,4,5]. If the next
+    group uses the same table, its selector is just "0" (index 0).
+    Because neighbouring groups often reuse a table, most selectors cost
+    only one or two bits.
+
+    The resulting selector list tells the main decoding loop which table to
+    use for each group. For this input there are 6 tables and 2,966
+    selectors. The step runs once per block.
+
+(e) Code lengths - compute_tables
+
+    bzip2 transmits only the code length of each symbol, not the codes
+    themselves. Because the codes are canonical (see (f)), the lengths
+    alone are enough to rebuild every code.
+
+    For each Huffman table, the decoder reads a 5-bit starting length.
+    Each symbol's length is then coded as a change from the current
+    length, using a sequence of 2-bit pairs followed by a terminating 0:
+      "10"  increase the length by one
+      "11"  decrease the length by one
+      "0"   stop; the current length belongs to this symbol
+    The result is also the starting length for the next symbol. Lengths
+    must stay in the range 0..20.
+
+    Example: starting from length 5, the bits "0" give the next symbol
+    length 5, "10 10 0" give length 7, and "11 0" give length 6.
+    Neighbouring symbols usually have similar lengths, so most symbols
+    cost only one or a few bits.
+
+    For each table, compute_tables() then builds the Huffman table from
+    these lengths: OrderedHuffmanTable creates the sorted entry list,
+    populate_huffman_symbols() assigns the codes, and min_max_bits()
+    records the shortest and longest code. For this input the code
+    lengths range from 2 to 15 bits. The step runs once per block.
+
+(f) Canonical Huffman construction - HuffmanTable
+
+    A HuffmanLength object is created for each value with a nonzero code
+    length; values with length 0 do not occur in the block and get no
+    code. The objects are sorted by (code length, decoded value).
+    populate_huffman_symbols() then assigns the actual bit patterns:
+    patterns of the same length receive consecutive integer values; when
+    the length increases, the running value is incremented and then
+    shifted left by the difference in lengths.
+
+    Example (verified with the benchmark's own code): lengths [3,2,3,2,0]
+    for values 0..4 give
+
+      value   length   pattern
+        1       2        00
+        3       2        01
+        0       3        100
+        2       3        101
+        4       0        (unused, no pattern)
+
+    This is canonical Huffman coding: the code lengths and the fixed
+    ordering of decoded values determine all the bit patterns, which is
+    why only the lengths are transmitted (see (e)).
+
+    Two properties follow from the construction:
+      - Prefix-free: every longer pattern is numerically placed after all
+        shorter patterns, so no pattern is the beginning of another. A
+        bit sequence can therefore be decoded without ambiguity.
+      - Contiguous ranges: all patterns of one length form a consecutive
+        range of integers. A decoder can therefore identify a symbol by
+        comparing the next n bits against the range of each length, or
+        with a lookup table indexed by those bits. The benchmark's
+        decoder does not exploit this property (see (g)).
+
+    Naming note: HuffmanLength.code stores the decoded value, while
+    HuffmanLength.symbol stores its assigned bit pattern. The code also
+    calculates reverse_symbol (the bit-reversed pattern) for the LSB-first
+    gzip decoder, but the bzip2 path does not use it. For this input each
+    of the 6 tables holds up to 147 entries.
+
+(g) Huffman decoding - find_next_symbol(field, reversed=False)
+
+    The function scans the Huffman table, which is sorted by code length
+    and decoded value. When it reaches a new code length, it peeks at
+    that many input bits with snoopbits(). It compares the peeked value
+    with each entry of that length, reusing the peeked value until the
+    length changes.
+
+    On a match, readbits() consumes the matched code and the function
+    returns its decoded value. The first match is always the correct
+    one: shorter lengths are tried first, and because the code is
+    prefix-free (see (f)), no shorter pattern can match the beginning of
+    a longer code.
+
+    Example, using the table from (f), with the next input bits "101...":
+      length 2: peek "10" = 2   compare with 00, 01    no match
+      length 3: peek "101" = 5  compare with 100       no match
+                                compare with 101       match
+      readbits(3) consumes "101" and the function returns value 2.
+    Decoding this one symbol examined 4 entries and called snoopbits()
+    twice.
+
+    The bzip2 caller passes reversed=False, so entries are compared by
+    their symbol (MSB-first pattern). After each group of 50 decoded
+    symbols, the main loop selects the next Huffman table from
+    selectors_list.
+
+    Measured behaviour for this input (instrumentation):
+      symbols decoded ........................ 148,271
+      table entries examined ................. 883,623  (6.0 per symbol)
+      snoopbits() calls ...................... 341,601  (2.3 per symbol)
+      readbits() calls ....................... 148,271  (1 per symbol)
+      average code length .................... 3.6 bits
+
+    Every decoded symbol therefore involves a Python loop over table
+    entries with attribute lookups on each entry, several bit-reader
+    method calls, and a second extraction of the same bits by readbits().
+    The search is linear over entries even though codes of one length
+    form a contiguous numeric range (see (f)). Whether this function is
+    the dominant cost must be confirmed by profiling (Section 2).
+
+(h) RLE2 decoding - RUNA / RUNB
+
+    After MTF, runs of zeros are very common: a zero means "the same byte
+    as before". bzip2 therefore does not code each zero separately.
+    Symbols 0 (RUNA) and 1 (RUNB) together encode the length of a run of
+    MTF index 0, i.e. repetitions of the byte currently at the front of
+    favourites.
+
+    The run length is written in bijective base 2: base 2 with digits 1
+    (RUNA) and 2 (RUNB) instead of 0 and 1, least significant digit
+    first. The k-th run symbol (k = 0, 1, 2, ...) adds (1 << k) for RUNA
+    or (2 << k) for RUNB:
+
+      run length   symbols        value
+          1        RUNA           1
+          2        RUNB           2
+          3        RUNA RUNA      1 + 2
+          4        RUNB RUNA      2 + 2
+          5        RUNA RUNB      1 + 4
+          6        RUNB RUNB      2 + 4
+
+    Because there is no zero digit, every run length has exactly one
+    encoding and no terminator is needed; a run of n bytes costs about
+    log2(n) symbols.
+
+    The decoder accumulates the length until any non-run symbol arrives,
+    including EOB. It then appends favourites[0] * repeat to the output
+    buffer as a single bytes object and processes the non-run symbol.
+    RUNA and RUNB do not change the order of the MTF list.
+
+    Measured for this input: 58,433 run symbols encode 34,664 runs
+    totalling 246,347 bytes (73% of the 336,184-byte block); the longest
+    run is 8,157 bytes. Together with 89,837 MTF symbols and one EOB,
+    this accounts for all 148,271 decoded symbols.
+
+(i) Inverse move-to-front
+
+    Move-to-front replaces each byte by its current position in a list of
+    recently used bytes, then moves that byte to the front. After the BWT,
+    equal byte values tend to appear in clusters, so a byte is usually
+    near the front when it appears again and is coded with a small index.
+
+    A non-run symbol r (from 2 up to but excluding EOB) represents MTF
+    index r - 1. The offset exists because symbols 0 and 1 are RUNA/RUNB
+    and index 0 has no symbol of its own (see (h)). The decoder appends
+    the byte at that index in favourites, then moves the byte to the
+    front of the list.
+
+    Example, with favourites = [a, b, c, d]:
+      symbol 3 -> index 2 -> output c, list becomes [c, a, b, d]
+      symbol 2 -> index 1 -> output a, list becomes [a, c, b, d]
+      symbol 2 -> index 1 -> output c, list becomes [c, a, b, d]
+    Two bytes that alternate keep costing index 1, even though c was
+    originally at position 2.
+
+    Measured for this input: 89,837 byte MTF operations with an average
+    index of 7.2 over a 145-byte alphabet.
+
+    The implementation rearranges the list using:
+
+        l[:] = l[c:c+1] + l[0:c] + l[c+1:]
+
+    This builds three slice lists, joins them with two concatenations
+    (creating an intermediate and a final list), and copies the result
+    back into l. Each operation therefore allocates five temporary lists
+    and copies about 3A element references, where A is the alphabet size
+    (145 here, at most 256), independent of how small the index is. The
+    copying runs in native code and moves references rather than bytes,
+    so allocation and the Python-level call to move_to_front() may be a
+    large part of the cost; this must be confirmed by profiling
+    (Section 2).
+
+(j) Inverse Burrows-Wheeler Transform - bwt_transform / bwt_reverse
+
+    The BWT sorts all rotations of the block. The decoded block L is the
+    last column of the sorted rotation matrix, and the block header
+    supplies origPtr, the row that contains the original byte order. The
+    first column, F, contains the same bytes sorted in ascending order.
+
+    Example (verified with the benchmark's own functions), for "banana":
+
+      row   rotation   F   L
+       0    abanan     a   n
+       1    anaban     a   n
+       2    ananab     a   b
+       3    banana     b   a     <- origPtr = 3
+       4    nabana     n   a
+       5    nanaba     n   a
+
+      L = "nnbaaa", F = "aaabnn"
+
+    Key property: the k-th occurrence of a byte in F and the k-th
+    occurrence of the same byte in L are the same character of the text.
+    Rows that begin with a given byte and rows that end with it are both
+    ordered by the text following that byte, so their order matches.
+
+    bwt_transform() finds where each byte value begins in F (base), then
+    processes L from left to right, pairing the k-th occurrence in L with
+    the k-th occurrence in F:
+
+        T[base[L[i]]] = i
+        base[L[i]] += 1
+
+    For "banana" this gives T = [3, 4, 5, 2, 0, 1]. Row T[j] is the
+    rotation that starts one character later in the text than row j, so
+    its last character L[T[j]] is the first character of row j.
+
+    bwt_reverse() starts at origPtr and follows this mapping exactly
+    len(L) times. At each step it updates the position with end = T[end]
+    and appends L[end]:
+
+      step   end        output
+       1     3 -> 2     L[2] = b
+       2     2 -> 5     L[5] = a
+       3     5 -> 1     L[1] = n
+       4     1 -> 4     L[4] = a
+       5     4 -> 0     L[0] = n
+       6     0 -> 3     L[3] = a          result: "banana"
+
+    Fixed iteration count: the source comments explain that an earlier
+    version stopped when the walk returned to its starting position. For
+    periodic data, T splits into several shorter cycles. For "abab"
+    (L = "bbaa", origPtr = 0, T = [2, 3, 0, 1]) the walk visits 2, 0, 2, 0
+    and returns to the start after 2 steps, so the old loop would output
+    only "ab". Iterating exactly len(L) times produces "abab".
+
+    Cost: F is computed with the general-purpose sorted(), O(n log n),
+    and base is located with 256 calls to F.find(). Building T and
+    following it are two Python loops of n iterations each, with O(n)
+    extra space; for this input n = 336,184. The walk has a dependency
+    between steps, because each position is obtained from the previous
+    one, so the steps cannot simply be executed in parallel. Each step
+    also reads T at an unpredictable position of a large array, an access
+    pattern that is unfriendly to CPU caches.
+
+(k) RLE1 expansion - final loop in decode_huffman_block
+
+    Why it exists: the original bzip2 BWT sorting became very slow on
+    long runs of identical bytes, so the compressor shortens such runs
+    before the BWT. The decoder undoes this step last.
+
+    Encoding rule: a run of 4 to 259 identical bytes is written as four
+    copies of the byte followed by a count byte (0..255) giving the
+    number of additional copies. A run of exactly 4 bytes is therefore
+    followed by a count of 0, and a run longer than 259 bytes is split
+    into several such groups.
+
+    The decoder scans the output of the inverse BWT. When it finds four
+    equal bytes (and at least one more byte remains), it treats the
+    fifth byte as the count, appends the byte (count + 4) times, and
+    advances past all five encoded bytes. The count byte is not
+    validated; the rule above guarantees it is present. Otherwise, it
+    appends one byte and advances by one position.
+
+    Example: "xxxx" + 0x03 + "y"  ->  "xxxxxxx" + "y"
+             "aaaa" + 0x00        ->  "aaaa"
+
+    Measured for this input: 336,184 input bytes, 302,016 loop
+    iterations, 8,542 runs expanded, 399,360 output bytes.
+
+    Cost: each iteration performs Python-level indexing, comparisons,
+    len() calls, a slice and an out.append(). Single-byte slices return
+    objects that CPython caches for each byte value, so only the 8,542
+    expanded runs allocate new bytes objects. Every iteration adds one
+    fragment to out, which therefore holds 302,016 references;
+    bzip2_main() joins them after decoding all blocks.
+
+
+1.6 Main data structures
+------------------------
+Sizes are for this input (one block).
+
+  RBitfield        Python int holding unread compressed bits, plus the
+                   count of valid bits. During symbol decoding it holds at
+                   most 22 bits (49 when a 48-bit marker is read).
+                   Results of shifts and masks are new int objects unless
+                   they fall in CPython's small-integer cache (-5..256).
+
+  HuffmanTable     6 tables, each a Python list of up to 147 HuffmanLength
+                   objects sorted by (code length, decoded value). Every
+                   comparison in find_next_symbol() reads object attributes.
+
+  selectors_list   List of 2,966 table indices, one per group of up to 50
+                   symbols.
+
+  favourites       MTF list of 145 one-byte bytes objects, rearranged
+                   on every non-run symbol.
+
+  buffer           List of bytes fragments (single bytes and runs) joined
+                   into the block's byte string L of 336,184 bytes before
+                   the inverse BWT.
+
+  T                Python list of 336,184 positions. Each entry is a
+                   reference to a separate int object, so T occupies about
+                   12 MB (2.7 MB list + int objects) rather than a compact
+                   integer array; it is read at unpredictable positions.
+
+  out              List of final bytes fragments (302,016 for this input),
+                   joined into 399,360 bytes after all blocks are decoded.
+
+
+1.7 Candidate costs to investigate
+----------------------------------
+Code inspection suggests the following hypotheses about runtime cost:
+
+  H1. find_next_symbol() is the largest cost: 148,271 symbols, each with a
+      linear search over table objects and several bit-reader calls.
+  H2. RBitfield refills (67,562 one-byte reads, each through a chain of
+      Python calls) add significant overhead, mostly inside H1.
+  H3. The per-byte Python loops - building and walking T (336,184
+      iterations each) and RLE1 expansion (302,016 iterations) - are the
+      next largest cost.
+  H4. move_to_front() (89,837 calls, five temporary lists each) is a
+      smaller but measurable cost.
+  H5. Header parsing and table construction run once per block and are
+      negligible.
+
+These are hypotheses. Section 2 uses profiling data to confirm or reject
+each one.
+
+
+1.8 Relevant implementation limitations
+---------------------------------------
+  - Block and stream CRCs are read but never verified; output is checked
+    only by the MD5 digest (see 1.2).
+  - The BitfieldBase copy constructor assigns self.count = x.bitfield
+    instead of x.count. The bit buffer is copied correctly and the file
+    object is shared, and after the 16-bit magic the buffer is empty.
+    The wrong count affects only tell(), which is used only in exception
+    messages, so decoding is unaffected.
+  - Several error paths use raise "string", which is invalid in Python 3.
+    Execution still stops, but with TypeError instead of the intended
+    message. The supplied input never reaches those paths.
+  - The main loop tests selector_pointer <= len(selectors_list); "<" is
+    correct. It is harmless only because EOB is decoded first. An
+    optimized loop must preserve or deliberately fix this behaviour.
+  - Code after the raise in find_next_symbol() is unreachable and can be
+    removed without changing behaviour.
+  - bwt_reverse() uses a fixed iteration count as a workaround for cycles
+    in T (see 1.5(j)); any rewrite must keep the n-step walk.
+
+
+================================================================================
+2. INITIAL ANALYSIS
+================================================================================
+
+2.1 Environment and measurement method
+--------------------------------------
+
+Test environment
+  Host .................. Technion course server naranja10
+  Virtualization ........ QEMU with KVM acceleration (-accel kvm,
+                          -cpu host), 4 GB RAM, 1 virtual CPU
+  Guest OS .............. Ubuntu 22.04 cloud image,
+                          Linux 5.15.0-1101-kvm
+  Interpreter (timing) .. CPython 3.10.12, release build (python3)
+  Interpreter (perf) .... CPython 3.10.12, debug build (python3-dbg)
+  Benchmark tools ....... pyperformance 1.14.0, pyperf 2.10.0
+  Profiling tools ....... cProfile, py-spy 0.4.2, Linux perf,
+                          Brendan Gregg's FlameGraph scripts
+
+The runs were managed by script_pyflate.sh. Its baseline stage measures
+the unmodified benchmark with pyperformance. Its profile stage collects
+cProfile results, perf samples, and flame graphs. The script also contains
+stages for measuring and comparing an optimized implementation.
+
+Timing method
+  The baseline was measured with pyperformance using the release Python
+  interpreter. pyperf performed one calibration run and then recorded 40
+  runs containing measured values. Each run included one warmup and three
+  measured values, giving 120 measured values in total. Warmups were
+  excluded from the reported result.
+
+  Calibration selected one loop per value. In this benchmark, one loop
+  decompresses the complete interpreter.tar.bz2 input once. We report
+  the mean and standard deviation of the measured execution times and
+  retain the JSON file containing the individual measurements and
+  environment metadata.
+
+Profiling method
+  Profiling was performed separately from the pyperformance timing run.
+  bench_driver.py imports the benchmark source and calls
+  bench_pyflake() directly. This gives each profiler a repeated
+  decompression workload without including pyperf's calibration and
+  worker-process activity in the collected profile.
+
+  cProfile   Ran on the release interpreter for one decompression.
+             It recorded function call counts and self and cumulative
+             times. Instrumenting calls adds overhead to every function
+             call, so its elapsed time is not compared with the baseline
+             and functions with many calls appear larger than they are.
+
+  py-spy     Sampled the release interpreter during five
+             decompressions at 999 Hz. Its flame graph identifies
+             Python functions and source lines. The reported shares
+             are sampling estimates.
+
+  perf       Sampled five decompressions on python3-dbg at 999 Hz
+             with call graphs (-g). Its report and flame graph show
+             time spent in CPython's native functions. The debug
+             interpreter has different execution costs from the
+             release interpreter, so its elapsed time and function
+             percentages are interpreted separately.
+
+Measurement validity
+  Earlier runs of the unchanged benchmark were unstable: their
+  measurements formed clusters near 1.12 seconds and 2.3 seconds, and
+  their standard deviations were approximately 27-28% of the mean.
+  Inspection of the VM showed that an apt update check was running in
+  the background and contending for its single virtual CPU. After
+  background update activity was stopped, repeated runs of the
+  unchanged benchmark each measured approximately 1.12 +/- 0.01
+  seconds. pyperf reported no significant difference between those
+  repeated runs. CPU activity was checked with top before subsequent
+  measurements. The unstable earlier runs are not used as the baseline.
+
+  The virtual CPU did not expose usable hardware performance counters:
+  a perf recording with the default cycles event produced no samples.
+  The perf profile therefore uses the software cpu-clock event. Its
+  samples help locate where the debug process spent CPU time, but they
+  do not provide hardware event counts such as instructions or cache
+  misses.
+
+  Because the VM has one virtual CPU, py-spy's sampling activity
+  competes with the benchmark. Its runs took approximately 2.1-2.2
+  seconds per decompression. Those elapsed times are not used for
+  performance comparisons. The sampled function shares are treated
+  as estimates and checked against cProfile and the native perf
+  profile.
+
+2.2 Baseline results
+--------------------
+
+The unmodified benchmark was measured with pyperformance in rigorous mode
+on the release interpreter:
+
+  Mean +- std dev ......... 1.12 s +- 0.01 s
+  Median +- MAD ........... 1.12 s +- 0.01 s
+  Minimum / maximum ....... 1.10 s / 1.18 s
+  Measured values ......... 120 (40 runs x 3 values, 1 loop per value)
+
+The standard deviation is about 1% of the mean; mean and median are equal
+at the reported precision. Two independent runs produced the same reported
+mean, and pyperf compare_to found no significant difference (see 2.1).
+This baseline is the reference for the optimization comparison in Section 4.
+
+2.3 Flame graphs and profiling
+------------------------------
+
+The py-spy flame graph profiles the release interpreter over five
+decompressions. Its widest branches are Huffman decoding
+(find_next_symbol and its bit-reader calls), move_to_front, inverse BWT,
+and the final RLE1 loop. This identifies where execution time is spent
+without adding overhead to every function call. The sampled shares of
+total runtime are:
+
+  Huffman decoding, find_next_symbol and callees ....... 45.1%
+    of which bit-reader methods (snoopbits, readbits,
+    _mask, needbits/_more/_read) ....................... about 29%
+    of which the table search itself ................... about 9%
+  move_to_front (one line: the list rebuild) ........... 17.4%
+  RLE1 expansion loop .................................. 14.2%
+  inverse BWT (bwt_transform 7.8%, walk 5.1%) .......... 12.9%
+  main Huffman loop, own lines .......................... 7.8%
+
+cProfile confirms how often these operations run in one decompression:
+
+  find_next_symbol ....... 148,271 calls
+  snoopbits .............. 341,601 calls
+  move_to_front ..........  92,803 calls
+  _more ..................  67,562 calls
+  total Python calls ..... 3,185,461
+
+cProfile's own time shares differ from py-spy's, for example 10% versus
+17.4% for move_to_front, because its overhead is charged per function
+call and move_to_front performs its work in one native list operation.
+The py-spy shares are therefore used for proportions and the cProfile
+output for call counts.
+
+The perf flame graph profiles the debug interpreter. It shows time in
+CPython's bytecode execution, list operations, function calls, and memory
+management. Because it uses a different interpreter build and its call
+stacks are incomplete, we use it to identify native mechanisms, not to
+estimate the release benchmark's time shares.
+
+Together, the profiles make Huffman decoding and bit reading the first
+optimization targets. Move-to-front and inverse BWT are also substantial.
+The 1.12 s baseline in Section 2.2, rather than any profiled runtime,
+will be used to measure improvement.
+
+2.4 Identified bottlenecks
+--------------------------
+
+The py-spy profile identifies four main cost centres:
+
+1. Huffman decoding and bit reading (about 45%)
+   find_next_symbol searches a Huffman table for every decoded symbol
+   and repeatedly calls the bit-reader methods. snoopbits() peeks at
+   bits, then readbits() extracts the matched bits again. Both also
+   compute masks in Python. An optimization should reduce repeated
+   work and Python-level calls per symbol.
+
+2. Inverse move-to-front (about 17%)
+   move_to_front() runs 92,803 times per decompression (89,837 times for
+   decoded bytes, the rest for table selectors). Its single line of code
+   rebuilds the favourites list using slices and concatenation. Moving
+   the selected element within the list may reduce this cost.
+
+3. RLE1 expansion (about 14%)
+   The final loop examines the inverse-BWT output in Python, checking
+   for runs and appending small bytes objects to the output. Processing
+   larger portions of the data may reduce loop and allocation costs.
+
+4. Inverse BWT (about 13%)
+   bwt_transform() builds a position mapping, and bwt_reverse() follows
+   it to reconstruct the block. Both process the block in Python.
+   Following the mapping is sequential because each position determines
+   the next one. Sorting and conversion on the line F = bytes(sorted(L))
+   account for about 2% of the profile.
+
+Together, these regions account for roughly 90% of the samples. The
+measurements confirm three of the expectations listed in 1.7: Huffman
+decoding is the largest cost (H1), the per-byte loops of the inverse BWT
+and RLE1 are the next largest (H3), and header parsing and table
+construction are negligible at under 1% (H5). Two expectations were
+wrong: the bit-reader refills were expected to be significant but account
+for only 6% (H2), and move_to_front was expected to be a minor cost (H4)
+although it is the most expensive single line in the program.
+
+Huffman decoding is the largest target, while move_to_front() is a
+particularly simple operation to change and test. We will measure each
+optimization against the 1.12 s baseline rather than assume its profile
+share will translate directly into a speedup.
+
+
+================================================================================
+3. OPTIMIZATIONS
+================================================================================
+
+The optimizations were applied to a separate copy of the benchmark
+(pyflate/bm_pyflate_opt/run_benchmark.py). The original remains unchanged
+for comparison. Each optimized benchmark call checks the MD5 digest of its
+final decompressed output against the expected result for the supplied
+archive.
+
+Steps 1-3 were measured separately after each change. The RLE1 and BWT
+changes were measured together in the full benchmark, so their reported
+gain is combined. All speedups below come from pyperformance measurements,
+not profiler runtimes.
+
+3.1 Move-to-front: move the element instead of rebuilding the list
+-------------------------------------------------------------------
+Before optimization, move_to_front accounted for about 17% of sampled
+runtime.
+
+Original:
+    l[:] = l[c:c + 1] + l[0:c] + l[c + 1:]
+
+Optimized:
+    l.insert(0, l.pop(c))
+
+The original expression creates slices and concatenates them before
+replacing the list's contents. The optimized version removes the selected
+element and inserts it at the front using native list operations. Both
+produce the same list order, but the new version avoids creating temporary
+slice lists.
+
+Result: 15.8% less time than the baseline.
+
+3.2 Bit reader: reduce calls and repeated work
+----------------------------------------------
+Bit reading was a substantial part of Huffman decoding. Three changes
+reduced its Python-level overhead:
+
+  - The mask expression (1 << n) - 1 was inlined into snoopbits() and
+    readbits(), removing calls to _mask() from these hot paths.
+  - The refill chain needbits() -> _more() -> _read() -> file.read(1)
+    was consolidated into _fill(), which keeps the bit buffer and bit
+    count in local variables while refilling.
+  - find_next_symbol() avoids repeated lookups inside its search loop
+    and uses skipbits() after a match. The code has already inspected
+    the matching bits with snoopbits(), so skipbits() consumes them
+    without extracting the same value again.
+
+Result: 15.1% less time than step 1.
+
+3.3 Huffman decoding: replace the linear search with a lookup
+--------------------------------------------------------------
+After step 2, Huffman decoding remained a major cost. The original
+find_next_symbol() searched table entries for each decoded symbol.
+
+The optimized version builds lookup arrays after reading each Huffman
+table's code lengths. For each possible max_bits-bit prefix, the arrays
+store the decoded symbol and the number of bits to consume. Decoding
+then uses the peeked bits as an index:
+
+    peek = snoopbits(t_max)
+    r = t_symbols[peek]
+    skipbits(t_lengths[peek])
+
+This removes the per-symbol scan over HuffmanLength objects and the
+repeated peeks at different code lengths. Building the lookup costs time
+and memory once per table, but the resulting arrays are reused across
+the block's 148,271 decoded symbols.
+
+Result: 24.3% less time than step 2.
+
+3.4 RLE1 expansion: find runs with a regular expression
+-------------------------------------------------------
+After step 3, the RLE1 loop accounted for about 24% of sampled runtime.
+
+The original Python loop checks the block byte by byte for runs. The
+optimized version searches for four identical consecutive bytes with
+a compiled regular expression:
+
+    run_re = re.compile(rb"(.)\1{3}", re.DOTALL)
+
+Each search scans in native code. Data between runs is copied as one
+slice, and each encoded run is expanded as before. This reduces the
+number of Python loop iterations and small bytes objects created.
+
+3.5 Inverse BWT: bucket positions by byte value
+------------------------------------------------
+After step 3, inverse BWT accounted for about 26% of sampled runtime.
+
+The original bwt_transform() sorts the block to construct its first
+column, searches for the starting position of each byte value, and
+builds the position mapping. The optimized version makes one list of
+positions per byte value, fills those lists in a single pass over the
+block, then joins them in byte-value order. Positions of equal bytes
+remain in their original order, preserving the mapping.
+
+Three complete implementations were timed on the block of this input
+(336,184 bytes), each verified to produce an identical mapping:
+
+    original (sort + 256 find() scans + mapping loop) ..... 84.3 ms
+    collections.Counter for the offsets + mapping loop .... 78.0 ms
+    buckets (adopted) ..................................... 34.1 ms
+
+Replacing only the offset computation gains little, because most of the
+cost is the mapping loop rather than the sort; bucketing removes both.
+Computing the offsets with 256 bytes.count() calls was also measured and
+is slower than the original sort (74.3 ms against 27.2 ms for that step
+alone). Replacing the BWT walk's output list with a bytearray was slower
+as well. The dependent walk itself was left unchanged.
+
+Combined result of steps 3.4 and 3.5: 34.7% less time than step 3.
+
+3.6 Overall result and rejected replacement
+-------------------------------------------
+The baseline averaged 1122.7 ms per decompression; the final version
+averaged 396.7 ms. This is a 64.7% reduction in execution time, or a
+2.83x speedup.
+
+Replacing the decoder with Python's bz2 module was not adopted. The
+benchmark measures Python executing the decompression stages, whereas
+bz2 would perform the decoding in a native library. The optimizations
+above retain those stages and produce the expected output for the
+supplied archive.
+
+
+================================================================================
+4. PERFORMANCE COMPARISON
+================================================================================
+
+All measurements use pyperformance in rigorous mode with the release
+interpreter, 120 measured values per result, under the conditions described
+in 2.1. The optimized benchmark is run with --same-loops, so each measured
+value covers the same amount of work as the baseline.
+
+  step                         mean          gain over    cumulative
+                                             previous     speedup
+  baseline                1122.7 ms +- 13.4       -           1.00x
+  1  move-to-front         945.3 ms +-  9.3     15.8%         1.19x
+  2  bit reader            802.4 ms +-  7.4     15.1%         1.40x
+  3  Huffman lookup        607.5 ms +-  9.5     24.3%         1.85x
+  4+5 RLE1 and BWT         396.7 ms +-  3.9     34.7%         2.83x
+
+Overall: 1122.7 ms -> 396.7 ms, a reduction of 64.7% (2.83x). The project
+requires an improvement of at least 7%.
+
+The result is far outside the measurement noise. The standard deviation of
+each result is about 1% of its mean, and the two distributions do not
+overlap: the baseline's fastest value is 1.10 s while the optimized version's
+slowest is 411 ms. pyperf compare_to reports every step as significant.
+
+The improvements are consistent with the profile that motivated them.
+Move-to-front was measured at 17.4% of runtime and its replacement returned
+15.8%, which indicates that nearly all of its cost was list allocation and
+copying rather than the element movement itself. The bit-reader changes
+targeted about 29% of runtime and returned 15.1%: the calls were made
+cheaper, not removed. The largest single gain came from replacing the linear
+Huffman search with a lookup table, and the per-byte Python loops of RLE1 and
+the inverse BWT together gave the largest combined gain.
+
+Correctness was verified at every step: the benchmark compares the MD5 digest
+of the decompressed output against the expected value, so each measured run
+of the optimized version also confirms that the output is unchanged.
+
+Profile of the optimized version
+--------------------------------
+The optimized benchmark was profiled again with py-spy under the same
+conditions as in 2.3. The distribution of the remaining 397 ms differs from
+the baseline:
+
+  area                                      optimized   baseline
+  Huffman decoding and bit reading             ~42%        45%
+    (snoopbits 10.6%, skipbits 11.6%,
+     _fill 9.7%, main loop lines)
+  inverse BWT (walk 15.9%, transform 9.4%)      25%        13%
+  move-to-front, including its call site        ~9%        17%
+  RLE1 expansion, now the regular-expression
+  search and the slice copies                   ~8%        14%
+
+Bit reading is now the largest remaining cost, although the work per symbol
+has been reduced to one peek and one consume operation: what remains is the
+Python method call and the arbitrary-precision integer arithmetic of the bit
+buffer itself. The share of the inverse BWT has roughly doubled, because its
+walk is the one stage that could not be improved: each position depends on
+the previous one (see 1.5(j)). These two observations motivate the hardware
+proposal in Section 5.
+
+Result files in the repository:
+  baseline.json, opt_step1_mtf.json, opt_step2_bitreader.json,
+  opt_step3_huffman.json, opt_step45_rle_bwt.json
+  comparison_step1_mtf.txt, comparison_step2_bitreader.txt,
+  comparison_step3_huffman.txt, comparison_step45_rle_bwt.txt
+  flamegraph_optimized.svg, pyspy_optimized.svg, pyspy_final.folded,
+  cprofile_optimized.txt, perf_top_symbols_optimized.txt
+
+
+================================================================================
+5. HARDWARE ACCELERATION PROPOSAL
+================================================================================
+
+5.1 Choice of component
+-----------------------
+After the software optimizations, the profile of the remaining 397 ms is
+roughly: Huffman decoding and bit reading 42%, inverse BWT 25%, move-to-front
+9%, RLE1 expansion 8% (see 4). Two components were considered.
+
+Huffman decoding and bit reading is the larger share, and a hardware decoder
+would be a natural fit for the lookup-table decoder of 3.3. It would however
+have to absorb the whole block-level context: the bitstream position, six
+Huffman tables, the selector list that switches tables every 50 symbols, the
+RUNA/RUNB accumulator and the move-to-front list. Anything less would require
+an interaction per symbol, and 148,271 interactions per block would cost far
+more than the work they offload.
+
+The inverse BWT was chosen instead. It is the second largest share and it has
+a clean boundary: the accelerator needs the block L, its length and origPtr,
+and returns the reconstructed block. No bitstream state, no Huffman tables and
+no decoder state cross the interface. It is also the one stage that software
+could not improve further, because each step of the walk depends on the
+previous one (see 1.5(j)), so its share grew from 13% to 25% of runtime while
+everything around it became faster.
+
+5.2 Function
+------------
+The accelerator implements bwt_transform() and bwt_reverse() of the benchmark
+in four phases:
+
+  LOAD    store the block L in on-chip memory, count the 256 byte values
+  PREFIX  convert the counts into the starting offset of each byte value,
+          which is where that value begins in the first column F
+  BUILD   T[base[L[i]]++] = i for i = 0..n-1, the BWT reversal mapping
+  WALK    pos = origPtr; repeat n times: pos = T[pos], emit L[pos]
+
+The software keeps the following RLE1 stage, which was already optimized in
+3.4 and is not a good hardware candidate: its output length is data-dependent.
+
+5.3 Interfaces
+--------------
+Control and status registers (AXI4-Lite, 32-bit):
+
+  offset  name        dir  width  description
+  0x00    CTRL        W    1      writing 1 to bit 0 starts a block
+  0x04    STATUS      R    2      bit 0 busy, bit 1 done (cleared on read)
+  0x08    BLOCK_LEN   W    20     n, the number of bytes in L (1..2^20-1)
+  0x0C    ORIG_PTR    W    24     origPtr from the bzip2 block header
+
+Data streams (AXI4-Stream style, valid/ready handshake):
+
+  s_valid / s_data[7:0] / s_ready    input, the block L, one byte per cycle
+  m_valid / m_data[7:0] / m_ready    output, the reconstructed block
+
+Clock and reset: single clock domain, active-low synchronous-release reset.
+Target frequency 100 MHz, which is conservative for the logic involved; the
+critical path is a memory access plus an increment, not arithmetic.
+
+The streams are 8 bits wide because the walk produces exactly one byte per
+hop; widening them would not raise throughput, only shorten the LOAD phase.
+
+5.4 Architecture
+----------------
+
+                      +--------------------------------------------+
+   AXI4-Lite  <-->    |  CSR: CTRL / STATUS / BLOCK_LEN / ORIG_PTR  |
+                      +----------------------+---------------------+
+                                             |
+                                    +--------v---------+
+                                    |  control FSM     |
+                                    |  IDLE -> LOAD -> |
+                                    |  PREFIX -> BUILD |
+                                    |  -> WALK -> DONE |
+                                    +--+----+-------+--+
+                                       |    |       |
+          s_valid/s_data  ------------>|    |       |
+          (block L)                    |    |       |
+                                 +-----v--+ | +-----v-------------+
+                                 | L mem  | | | hist / base       |
+                                 | 1 MB   | | | 256 x 20 bit      |
+                                 | 8 bit  | | | counters, then    |
+                                 +--+-----+ | | running offsets   |
+                                    |       | +-----+-------------+
+                                    |       |       |
+                                    |  +----v-------v----+
+                                    |  |  T memory       |
+                                    |  |  1M x 20 bit    |
+                                    |  +----+------------+
+                                    |       |
+                                    |  +----v------------+
+                                    |  | position reg    |<--- origPtr
+                                    |  | cur = T[cur]    |----+
+                                    |  +----+------------+    |
+                                    |       |  (feedback)     |
+                                    +-------v-----------------+
+                                            |
+                                    +-------v---------+
+                                    | output register |---> m_valid/m_data
+                                    +-----------------+
+
+  LOAD   writes s_data into L memory at idx and increments hist[s_data].
+  PREFIX walks hist once: hist[i] <= running; running <= running + hist[i].
+  BUILD  reads L[i], writes T[hist[L[i]]] = i and increments hist[L[i]].
+  WALK   reads T[cur] to get the next position, reads L at that position and
+         registers it as the output byte, and feeds the position back as the
+         next address. The whole pipeline stalls while m_ready is low.
+
+Implementation: hw/bwt_accel.sv (SystemVerilog, about 200 lines), with the
+testbench hw/tb_bwt_accel.sv. The testbench streams five blocks through the
+accelerator and compares the output with the expected text; all vectors were
+produced with the benchmark's own Python functions, including the periodic
+input whose mapping T splits into short cycles (the case discussed in
+1.5(j)), and one test drives backpressure by accepting a byte only every
+other cycle. All tests pass under Icarus Verilog. The design is not
+synthesized and is not intended for tape-out.
+
+5.5 Hardware/software interface
+-------------------------------
+In the benchmark, the call
+
+    nt = bwt_reverse(b"".join(buffer), pointer)
+
+is replaced by a call into a small driver. The driver:
+
+  1. copies the block into a pinned DMA buffer (or receives it there
+     directly from the decoding loop),
+  2. writes BLOCK_LEN and ORIG_PTR, then sets the start bit in CTRL,
+  3. programs the input and output DMA channels for the two streams,
+  4. waits for the done interrupt, or polls STATUS for short blocks,
+  5. returns the output buffer to Python as a bytes object.
+
+From Python this would be reached through a C extension or ctypes wrapper, so
+one call per block, not per byte. The accelerator holds no state between
+blocks: the histogram is cleared when a block starts, so blocks can follow one
+another without reinitialization.
+
+5.6 Expected performance
+------------------------
+Cycle cost per block, with synchronous on-chip memory:
+
+  LOAD    n cycles (also the input transfer)
+  PREFIX  256 cycles
+  BUILD   n cycles
+  WALK    2n cycles (also the output transfer)
+  total   about 4n + 256 cycles
+
+The walk needs two cycles per byte because the address of the next hop is the
+data returned by the current read, and a block RAM or SRAM read is
+synchronous; the dependency cannot be pipelined away. For this input's block
+of n = 336,184 bytes the total is about 1.35 million cycles, or 13.4 ms at
+100 MHz.
+
+The same work currently costs about 99 ms in software, that is 25% of the
+optimized 397 ms. Replacing it gives:
+
+  stage speedup      99 ms / 13.4 ms  = 7.4x
+  overall speedup    1 / (0.75 + 0.25/7.4) = 1.27x
+  runtime            397 ms -> about 313 ms
+
+The theoretical ceiling, if the stage cost nothing at all, is 1.33x, so the
+accelerator captures most of what is available. Relative to the original
+benchmark the combined software and hardware result would be about 3.6x.
+
+Assumptions: the DMA sustains one byte per cycle in each direction; driver and
+interrupt overhead per block (a few microseconds) is negligible against 13 ms;
+the block is processed as one unit, as the format already requires; and the
+Python-side cost of handing the buffer to the driver replaces the current cost
+of building the output bytes object.
+
+If the memories could be read asynchronously, which is realistic only for
+small blocks in LUT-based distributed RAM, the walk would take one cycle per
+byte and the total would fall to about 3n + 256 cycles, 10.1 ms, raising the
+overall speedup to 1.29x. The difference is small because Amdahl's law, not
+the walk's cycle cost, is the limit here.
+
+5.7 Trade-offs
+--------------
+Area. The design is dominated by memory, not logic. Sized for a level-9
+block (900,000 bytes) it needs 900 kB for L, 20 bits x 900,000 = 2.25 MB for
+T, and 256 x 20 bits for the histogram. The datapath itself is a handful of
+counters, an adder and address multiplexers. On a mid-range FPGA the T memory
+alone would occupy most of the available block RAM; an ASIC implementation
+would be an SRAM macro with a small controller beside it. Supporting only
+smaller blocks (a lower bzip2 level) would cut the memory proportionally.
+
+Frequency. The critical path is one memory read plus the increment and
+multiplexing around it. 100 MHz is conservative; a higher clock would help
+proportionally, since the design is not limited by arithmetic. The walk cannot
+use a deeper pipeline to reach a higher clock, because each hop depends on the
+previous one.
+
+Power. The accelerator performs about 4 memory accesses per input byte across
+its phases, and no floating-point or wide arithmetic. Energy per byte should
+be far below that of a general-purpose core executing an interpreted loop for
+the same work, since it avoids instruction fetch, decode and the interpreter's
+object handling entirely. Against a compiled C implementation the advantage
+would be much smaller.
+
+Parallelism. The walk is inherently sequential, so the accelerator cannot be
+made faster by replicating the datapath within a block. Two useful forms of
+parallelism remain: several blocks of a multi-block stream could be processed
+by independent instances, and LOAD of the next block could overlap the WALK of
+the current one at the cost of a second L memory. The file used here contains
+a single block, so neither applies to this input.
+
+Alternative. Accelerating Huffman decoding and bit reading instead would
+address a larger share (42%) and, by Amdahl's law, allow up to 1.72x, but it
+requires moving the bitstream state, the six Huffman tables, the selector
+list, the run accumulator and the MTF list into hardware. That is a
+substantially larger design; it is the natural next step rather than a
+replacement for this one.
+
+
+================================================================================
+6. CONCLUSION
+================================================================================
+
+pyflate decompresses a bzip2 archive entirely in Python, so it measures the
+interpreter executing a real algorithm rather than a native compression
+library. Profiling the unmodified benchmark showed that the cost was spread
+over four stages: Huffman decoding with its bit reader (45%), inverse
+move-to-front (17%), RLE1 expansion (14%) and the inverse BWT (13%).
+
+The measurements corrected two expectations formed from reading the code. The
+bit-reader refills, which looked expensive because the file is read one byte
+at a time, accounted for only 6%; the real cost was the number of method calls
+and repeated mask computations per decoded symbol. Move-to-front, which looked
+minor, turned out to be the most expensive single line in the program, because
+its slice expression allocates and copies a 145-element list on every symbol.
+
+Five optimizations were applied, each measured separately against the
+baseline. None changes the algorithm or its output, which the benchmark's MD5
+check verifies on every run:
+
+  move-to-front moves one element instead of rebuilding the list   15.8%
+  the bit reader makes fewer calls and no repeated extraction      15.1%
+  Huffman decoding uses a lookup table instead of a linear search   24.3%
+  RLE1 finds runs with a regular expression, and the inverse BWT
+    buckets positions in one pass                                   34.7%
+
+Together they reduce the mean from 1122.7 ms to 396.7 ms, a 64.7% reduction
+or a 2.83x speedup, against a project requirement of 7%. The measurement
+noise is about 1% of the mean and the two distributions do not overlap.
+
+The gains follow the profile closely: move-to-front was measured at 17.4% and
+returned 15.8%, which shows that almost all of its cost was allocation and
+copying rather than moving the element. The largest single gain came from
+using a property of the data format itself, that canonical Huffman codes of
+one length form a contiguous numeric range, which turns a search into an
+indexing operation.
+
+After optimization the balance changed. The inverse BWT grew from 13% to 25%
+of runtime, because it is the one stage that could not be improved: its walk
+follows a chain of positions where each step depends on the previous one. That
+same property makes it a good hardware candidate, since a dedicated engine can
+perform a dependent memory hop every cycle or two while a CPU pays interpreter
+overhead for each one. The proposed accelerator implements the whole inverse
+BWT behind a single call, needs about 4n + 256 cycles per block, and would cut
+the stage from about 99 ms to 13.4 ms at 100 MHz. By Amdahl's law that is a
+1.27x overall improvement against a ceiling of 1.33x, or about 3.6x relative
+to the original benchmark. The design is written in SystemVerilog and verified
+in simulation against the Python implementation it replaces.
+
+The limits of the approach are visible in the same numbers. No single
+component now dominates, so further work would have to address several stages
+at once; the sequential dependency of the BWT walk bounds what any
+implementation of that stage can achieve; and the accelerator's cost is
+dominated by the 2.25 MB of on-chip memory the mapping requires, not by its
+logic. The larger remaining target, Huffman decoding and bit reading at 42%,
+would permit up to 1.72x but requires moving considerably more decoder state
+into hardware.
