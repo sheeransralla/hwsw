@@ -1,6 +1,8 @@
+.DS_Store
 pyflate/venv/
+pyflate/bm_pyflate/
+tools/FlameGraph/
 *.data
 *.prof
-*.folded
-tools/FlameGraph/
-.DS_Store
+*.pyc
+__pycache__/

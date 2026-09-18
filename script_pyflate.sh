@@ -10,11 +10,13 @@
 #   ./script_pyflate.sh optimized   pyperformance run of the optimized benchmark
 #   ./script_pyflate.sh profile-opt cProfile, perf report and flame graph (optimized)
 #   ./script_pyflate.sh compare     compare baseline and optimized results
+#   ./script_pyflate.sh save NAME   snapshot the current optimized results
 #   ./script_pyflate.sh all         every stage above, in order
 #
 # Settings can be overridden from the environment, for example:
 #   MODE=--rigorous ./script_pyflate.sh baseline
 #   PROFILE_LOOPS=10 ./script_pyflate.sh profile
+#   SKIP_APT=1 ./script_pyflate.sh setup      (packages already installed)
 #
 # Repository layout used by this script:
 #   script_pyflate.sh
@@ -47,6 +49,14 @@ PYTHON_DBG="${PYTHON_DBG:-python3-dbg}"
 MODE="${MODE:-}"                    # "", --fast or --rigorous
 PERF_FREQ="${PERF_FREQ:-999}"       # sampling frequency (Hz)
 PERF_EVENT="${PERF_EVENT:-cpu-clock}" # sampling event (cycles needs a PMU)
+SKIP_APT="${SKIP_APT:-0}"           # 1 = setup skips apt (tools already installed)
+
+# The VM runs as root, where sudo may not be installed; elsewhere it is needed.
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
 PROFILE_LOOPS="${PROFILE_LOOPS:-5}" # decompressions per profiling run
 
 # ----------------------------------------------------------------------------
@@ -74,22 +84,35 @@ check_file() { [[ -f "$1" ]] || die "missing $1 ($2)"; }
 # Stage: setup
 # ----------------------------------------------------------------------------
 stage_setup() {
-    log "Installing system packages"
-    sudo apt-get update
-    sudo apt-get install -y python3 python3-dbg python3-pip python3-venv git perl
-    if ! command -v perf >/dev/null 2>&1; then
-        sudo apt-get install -y "linux-tools-$(uname -r)" \
-            || sudo apt-get install -y linux-tools-generic
+    if [[ "$SKIP_APT" == 1 ]]; then
+        log "Skipping system packages (SKIP_APT=1)"
+    else
+        log "Installing system packages"
+        $SUDO apt-get update
+        $SUDO apt-get install -y python3 python3-dbg python3-pip python3-venv git perl
+        if ! command -v perf >/dev/null 2>&1; then
+            $SUDO apt-get install -y "linux-tools-$(uname -r)" \
+                || $SUDO apt-get install -y linux-tools-generic
+        fi
+        # apt lists and cached packages are large; the VM image has little room
+        $SUDO apt-get clean
     fi
 
     log "Allowing perf to sample user and kernel stacks"
-    sudo sysctl -w kernel.perf_event_paranoid=-1
-    sudo sysctl -w kernel.kptr_restrict=0
+    $SUDO sysctl -w kernel.perf_event_paranoid=-1
+    $SUDO sysctl -w kernel.kptr_restrict=0
 
     log "Installing Python packages"
-    "$PYTHON" -m pip install --user --upgrade pyperformance pyperf
-    "$PYTHON" -m pip install --user py-spy \
-        || echo "py-spy not installed (optional Python-level flame graph)"
+    # Newer distributions refuse installs outside a virtual environment
+    # (PEP 668); --break-system-packages is the documented override.
+    pip_install() {
+        "$PYTHON" -m pip install --user --upgrade "$@" \
+            || "$PYTHON" -m pip install --user --upgrade --break-system-packages "$@"
+    }
+    pip_install pyperformance pyperf \
+        || echo "could not install pyperformance/pyperf (already present?)"
+    pip_install py-spy \
+        || echo "py-spy not installed (optional Python-level profile)"
 
     log "Fetching FlameGraph scripts"
     if [[ ! -d "$FLAMEGRAPH_DIR" ]]; then
@@ -225,10 +248,27 @@ profile_one() {
     local pyspy
     pyspy="$(find_pyspy || true)"
     if [[ -n "$pyspy" ]]; then
-        log "[$label] py-spy flame graph (Python-level function names)"
+        log "[$label] py-spy: flame graph and raw samples (Python function names)"
+        # py-spy can print "No child process" while exiting after it has already
+        # written its output, so the files are checked instead of the exit code.
         "$pyspy" record -r "$PERF_FREQ" -o "$RESULTS/pyspy_$label.svg" -- \
             "$PYTHON" "$DRIVER" --bench-dir "$bench_dir" --loops "$PROFILE_LOOPS" \
-            || echo "py-spy failed (optional); continuing"
+            >/dev/null 2>&1 || true
+        "$pyspy" record -r "$PERF_FREQ" --format raw \
+            -o "$RESULTS/pyspy_$label.folded" -- \
+            "$PYTHON" "$DRIVER" --bench-dir "$bench_dir" --loops "$PROFILE_LOOPS" \
+            >/dev/null 2>&1 || true
+        if [[ -s "$RESULTS/pyspy_$label.folded" ]]; then
+            echo "Written $RESULTS/pyspy_$label.svg"
+            echo "Written $RESULTS/pyspy_$label.folded"
+            "$PYTHON" "$ROOT/pyflate/summarize_pyspy.py" \
+                "$RESULTS/pyspy_$label.folded" \
+                | tee "$RESULTS/pyspy_$label.txt"
+        else
+            echo "py-spy produced no output (optional); continuing"
+        fi
+    else
+        echo "py-spy not installed (optional); skipping Python-level profile"
     fi
 }
 
@@ -269,6 +309,20 @@ EOF
 }
 
 # ----------------------------------------------------------------------------
+# Stage: save - snapshot the current optimized results under a step name
+# ----------------------------------------------------------------------------
+stage_save() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: $0 save <step-name>"
+    check_file "$RESULTS/optimized.json" "run optimized first"
+    cp "$RESULTS/optimized.json" "$RESULTS/opt_$name.json"
+    [[ -f "$RESULTS/comparison.txt" ]] &&
+        cp "$RESULTS/comparison.txt" "$RESULTS/comparison_$name.txt"
+    cp "$OPT_DIR/run_benchmark.py" "$RESULTS/run_benchmark_$name.py"
+    echo "Saved results and source snapshot for step '$name'"
+}
+
+# ----------------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------------
 case "${1:-}" in
@@ -278,6 +332,7 @@ case "${1:-}" in
     optimized)   stage_optimized ;;
     profile-opt) stage_profile_opt ;;
     compare)     stage_compare ;;
+    save)        stage_save "${2:-}" ;;
     all)
         stage_setup
         stage_baseline
@@ -287,7 +342,7 @@ case "${1:-}" in
         stage_compare
         ;;
     *)
-        sed -n '3,17p' "$0"
+        sed -n '3,19p' "$0"
         exit 1
         ;;
 esac
