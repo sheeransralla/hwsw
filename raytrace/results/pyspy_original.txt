@@ -1,0 +1,52 @@
+/root/hwsw-project/raytrace/results/pyspy_original.folded: 7759 samples
+
+=== self time by function ===
+ 16.48%  dot
+ 14.14%  __init__
+ 13.24%  intersectionTime
+ 12.36%  __sub__
+  6.87%  _lightIsVisible
+  4.82%  scale
+  4.51%  <listcomp>
+  4.21%  render
+  3.72%  plot
+  2.93%  rayColour
+  2.59%  colourAt
+  2.55%  normalized
+  2.47%  magnitude
+  1.39%  firstIntersection
+  1.28%  __add__
+
+=== total time by function (including callees) ===
+ 98.14%  <module>
+ 98.05%  main
+ 97.77%  bench_raytrace
+ 97.06%  render
+ 83.35%  rayColour
+ 58.85%  colourAt
+ 39.66%  visibleLights
+ 39.23%  _lightIsVisible
+ 37.45%  intersectionTime
+ 27.16%  <listcomp>
+ 23.87%  __init__
+ 18.20%  __sub__
+ 17.22%  dot
+ 13.62%  normalized
+  9.07%  scale
+
+=== self time by source line ===
+ 11.47%  dot:53
+  9.28%  __sub__:115
+  5.80%  _lightIsVisible:285
+  5.01%  dot:52
+  4.82%  scale:49
+  4.56%  intersectionTime:143
+  4.36%  <listcomp>:271
+  4.18%  intersectionTime:145
+  3.94%  __init__:25
+  3.27%  __init__:27
+  3.14%  __init__:26
+  2.78%  __sub__:114
+  2.65%  intersectionTime:144
+  2.55%  normalized:62
+  2.47%  magnitude:36

@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="778" onload="init(evt)" viewBox="0 0 1200 778" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = true;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="778" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">/root/.local/bin/py-spy record -r 999 -o /root/hwsw-project/raytrace/results/pyspy_optimized.svg -- python3 /root/hwsw-project/raytrace/bench_driver.py --bench-dir /root/hwsw-project/raytrace/bm_raytrace_opt --loops 5</text><text id="details" fill="rgb(0,0,0)" x="10" y="40.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="767.00"> </text><svg id="frames" x="10" width="1180" total_samples="3118"><g><title>&lt;module&gt; (bench_driver.py:18) (7 samples, 0.22%)</title><rect x="0.0321%" y="68" width="0.2245%" height="15" fill="rgb(227,0,7)" fg:x="1" fg:w="7"/><text x="0.2821%" y="78.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (7 samples, 0.22%)</title><rect x="0.0321%" y="84" width="0.2245%" height="15" fill="rgb(217,0,24)" fg:x="1" fg:w="7"/><text x="0.2821%" y="94.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (7 samples, 0.22%)</title><rect x="0.0321%" y="100" width="0.2245%" height="15" fill="rgb(221,193,54)" fg:x="1" fg:w="7"/><text x="0.2821%" y="110.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (7 samples, 0.22%)</title><rect x="0.0321%" y="116" width="0.2245%" height="15" fill="rgb(248,212,6)" fg:x="1" fg:w="7"/><text x="0.2821%" y="126.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (5 samples, 0.16%)</title><rect x="0.0962%" y="132" width="0.1604%" height="15" fill="rgb(208,68,35)" fg:x="3" fg:w="5"/><text x="0.3462%" y="142.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (5 samples, 0.16%)</title><rect x="0.0962%" y="148" width="0.1604%" height="15" fill="rgb(232,128,0)" fg:x="3" fg:w="5"/><text x="0.3462%" y="158.50"></text></g><g><title>&lt;module&gt; (pyperf/_runner.py:10) (4 samples, 0.13%)</title><rect x="0.3849%" y="340" width="0.1283%" height="15" fill="rgb(207,160,47)" fg:x="12" fg:w="4"/><text x="0.6349%" y="350.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (4 samples, 0.13%)</title><rect x="0.3849%" y="356" width="0.1283%" height="15" fill="rgb(228,23,34)" fg:x="12" fg:w="4"/><text x="0.6349%" y="366.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (4 samples, 0.13%)</title><rect x="0.3849%" y="372" width="0.1283%" height="15" fill="rgb(218,30,26)" fg:x="12" fg:w="4"/><text x="0.6349%" y="382.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (4 samples, 0.13%)</title><rect x="0.3849%" y="388" width="0.1283%" height="15" fill="rgb(220,122,19)" fg:x="12" fg:w="4"/><text x="0.6349%" y="398.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (4 samples, 0.13%)</title><rect x="0.3849%" y="404" width="0.1283%" height="15" fill="rgb(250,228,42)" fg:x="12" fg:w="4"/><text x="0.6349%" y="414.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (4 samples, 0.13%)</title><rect x="0.3849%" y="420" width="0.1283%" height="15" fill="rgb(240,193,28)" fg:x="12" fg:w="4"/><text x="0.6349%" y="430.50"></text></g><g><title>&lt;module&gt; (pyperf/_cpu_utils.py:11) (4 samples, 0.13%)</title><rect x="0.3849%" y="436" width="0.1283%" height="15" fill="rgb(216,20,37)" fg:x="12" fg:w="4"/><text x="0.6349%" y="446.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (4 samples, 0.13%)</title><rect x="0.3849%" y="452" width="0.1283%" height="15" fill="rgb(206,188,39)" fg:x="12" fg:w="4"/><text x="0.6349%" y="462.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (4 samples, 0.13%)</title><rect x="0.3849%" y="468" width="0.1283%" height="15" fill="rgb(217,207,13)" fg:x="12" fg:w="4"/><text x="0.6349%" y="478.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (4 samples, 0.13%)</title><rect x="0.3849%" y="484" width="0.1283%" height="15" fill="rgb(231,73,38)" fg:x="12" fg:w="4"/><text x="0.6349%" y="494.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (4 samples, 0.13%)</title><rect x="0.3849%" y="500" width="0.1283%" height="15" fill="rgb(225,20,46)" fg:x="12" fg:w="4"/><text x="0.6349%" y="510.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (4 samples, 0.13%)</title><rect x="0.3849%" y="516" width="0.1283%" height="15" fill="rgb(210,31,41)" fg:x="12" fg:w="4"/><text x="0.6349%" y="526.50"></text></g><g><title>&lt;module&gt; (importlib/metadata/__init__.py:17) (4 samples, 0.13%)</title><rect x="0.5773%" y="532" width="0.1283%" height="15" fill="rgb(221,200,47)" fg:x="18" fg:w="4"/><text x="0.8273%" y="542.50"></text></g><g><title>_handle_fromlist (&lt;frozen importlib._bootstrap&gt;:1078) (4 samples, 0.13%)</title><rect x="0.5773%" y="548" width="0.1283%" height="15" fill="rgb(226,26,5)" fg:x="18" fg:w="4"/><text x="0.8273%" y="558.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (4 samples, 0.13%)</title><rect x="0.5773%" y="564" width="0.1283%" height="15" fill="rgb(249,33,26)" fg:x="18" fg:w="4"/><text x="0.8273%" y="574.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (4 samples, 0.13%)</title><rect x="0.5773%" y="580" width="0.1283%" height="15" fill="rgb(235,183,28)" fg:x="18" fg:w="4"/><text x="0.8273%" y="590.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (4 samples, 0.13%)</title><rect x="0.5773%" y="596" width="0.1283%" height="15" fill="rgb(221,5,38)" fg:x="18" fg:w="4"/><text x="0.8273%" y="606.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (4 samples, 0.13%)</title><rect x="0.5773%" y="612" width="0.1283%" height="15" fill="rgb(247,18,42)" fg:x="18" fg:w="4"/><text x="0.8273%" y="622.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (4 samples, 0.13%)</title><rect x="0.5773%" y="628" width="0.1283%" height="15" fill="rgb(241,131,45)" fg:x="18" fg:w="4"/><text x="0.8273%" y="638.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (4 samples, 0.13%)</title><rect x="0.5773%" y="644" width="0.1283%" height="15" fill="rgb(249,31,29)" fg:x="18" fg:w="4"/><text x="0.8273%" y="654.50"></text></g><g><title>&lt;module&gt; (importlib/metadata/_adapters.py:3) (4 samples, 0.13%)</title><rect x="0.5773%" y="660" width="0.1283%" height="15" fill="rgb(225,111,53)" fg:x="18" fg:w="4"/><text x="0.8273%" y="670.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (4 samples, 0.13%)</title><rect x="0.5773%" y="676" width="0.1283%" height="15" fill="rgb(238,160,17)" fg:x="18" fg:w="4"/><text x="0.8273%" y="686.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (4 samples, 0.13%)</title><rect x="0.5773%" y="692" width="0.1283%" height="15" fill="rgb(214,148,48)" fg:x="18" fg:w="4"/><text x="0.8273%" y="702.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (4 samples, 0.13%)</title><rect x="0.5773%" y="708" width="0.1283%" height="15" fill="rgb(232,36,49)" fg:x="18" fg:w="4"/><text x="0.8273%" y="718.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (4 samples, 0.13%)</title><rect x="0.5773%" y="724" width="0.1283%" height="15" fill="rgb(209,103,24)" fg:x="18" fg:w="4"/><text x="0.8273%" y="734.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (4 samples, 0.13%)</title><rect x="0.5773%" y="740" width="0.1283%" height="15" fill="rgb(229,88,8)" fg:x="18" fg:w="4"/><text x="0.8273%" y="750.50"></text></g><g><title>&lt;module&gt; (pyperf/_runner.py:14) (8 samples, 0.26%)</title><rect x="0.5131%" y="340" width="0.2566%" height="15" fill="rgb(213,181,19)" fg:x="16" fg:w="8"/><text x="0.7631%" y="350.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (8 samples, 0.26%)</title><rect x="0.5131%" y="356" width="0.2566%" height="15" fill="rgb(254,191,54)" fg:x="16" fg:w="8"/><text x="0.7631%" y="366.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (8 samples, 0.26%)</title><rect x="0.5131%" y="372" width="0.2566%" height="15" fill="rgb(241,83,37)" fg:x="16" fg:w="8"/><text x="0.7631%" y="382.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (8 samples, 0.26%)</title><rect x="0.5131%" y="388" width="0.2566%" height="15" fill="rgb(233,36,39)" fg:x="16" fg:w="8"/><text x="0.7631%" y="398.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (8 samples, 0.26%)</title><rect x="0.5131%" y="404" width="0.2566%" height="15" fill="rgb(226,3,54)" fg:x="16" fg:w="8"/><text x="0.7631%" y="414.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (8 samples, 0.26%)</title><rect x="0.5131%" y="420" width="0.2566%" height="15" fill="rgb(245,192,40)" fg:x="16" fg:w="8"/><text x="0.7631%" y="430.50"></text></g><g><title>&lt;module&gt; (pyperf/_hooks.py:7) (6 samples, 0.19%)</title><rect x="0.5773%" y="436" width="0.1924%" height="15" fill="rgb(238,167,29)" fg:x="18" fg:w="6"/><text x="0.8273%" y="446.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (6 samples, 0.19%)</title><rect x="0.5773%" y="452" width="0.1924%" height="15" fill="rgb(232,182,51)" fg:x="18" fg:w="6"/><text x="0.8273%" y="462.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (6 samples, 0.19%)</title><rect x="0.5773%" y="468" width="0.1924%" height="15" fill="rgb(231,60,39)" fg:x="18" fg:w="6"/><text x="0.8273%" y="478.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (6 samples, 0.19%)</title><rect x="0.5773%" y="484" width="0.1924%" height="15" fill="rgb(208,69,12)" fg:x="18" fg:w="6"/><text x="0.8273%" y="494.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (6 samples, 0.19%)</title><rect x="0.5773%" y="500" width="0.1924%" height="15" fill="rgb(235,93,37)" fg:x="18" fg:w="6"/><text x="0.8273%" y="510.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (6 samples, 0.19%)</title><rect x="0.5773%" y="516" width="0.1924%" height="15" fill="rgb(213,116,39)" fg:x="18" fg:w="6"/><text x="0.8273%" y="526.50"></text></g><g><title>main (bench_driver.py:61) (18 samples, 0.58%)</title><rect x="0.2886%" y="84" width="0.5773%" height="15" fill="rgb(222,207,29)" fg:x="9" fg:w="18"/><text x="0.5386%" y="94.50"></text></g><g><title>load_benchmark (bench_driver.py:26) (18 samples, 0.58%)</title><rect x="0.2886%" y="100" width="0.5773%" height="15" fill="rgb(206,96,30)" fg:x="9" fg:w="18"/><text x="0.5386%" y="110.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (18 samples, 0.58%)</title><rect x="0.2886%" y="116" width="0.5773%" height="15" fill="rgb(218,138,4)" fg:x="9" fg:w="18"/><text x="0.5386%" y="126.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (18 samples, 0.58%)</title><rect x="0.2886%" y="132" width="0.5773%" height="15" fill="rgb(250,191,14)" fg:x="9" fg:w="18"/><text x="0.5386%" y="142.50"></text></g><g><title>&lt;module&gt; (run_benchmark.py:14) (18 samples, 0.58%)</title><rect x="0.2886%" y="148" width="0.5773%" height="15" fill="rgb(239,60,40)" fg:x="9" fg:w="18"/><text x="0.5386%" y="158.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (18 samples, 0.58%)</title><rect x="0.2886%" y="164" width="0.5773%" height="15" fill="rgb(206,27,48)" fg:x="9" fg:w="18"/><text x="0.5386%" y="174.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (18 samples, 0.58%)</title><rect x="0.2886%" y="180" width="0.5773%" height="15" fill="rgb(225,35,8)" fg:x="9" fg:w="18"/><text x="0.5386%" y="190.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (18 samples, 0.58%)</title><rect x="0.2886%" y="196" width="0.5773%" height="15" fill="rgb(250,213,24)" fg:x="9" fg:w="18"/><text x="0.5386%" y="206.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (18 samples, 0.58%)</title><rect x="0.2886%" y="212" width="0.5773%" height="15" fill="rgb(247,123,22)" fg:x="9" fg:w="18"/><text x="0.5386%" y="222.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (18 samples, 0.58%)</title><rect x="0.2886%" y="228" width="0.5773%" height="15" fill="rgb(231,138,38)" fg:x="9" fg:w="18"/><text x="0.5386%" y="238.50"></text></g><g><title>&lt;module&gt; (pyperf/__init__.py:19) (15 samples, 0.48%)</title><rect x="0.3849%" y="244" width="0.4811%" height="15" fill="rgb(231,145,46)" fg:x="12" fg:w="15"/><text x="0.6349%" y="254.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (15 samples, 0.48%)</title><rect x="0.3849%" y="260" width="0.4811%" height="15" fill="rgb(251,118,11)" fg:x="12" fg:w="15"/><text x="0.6349%" y="270.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (15 samples, 0.48%)</title><rect x="0.3849%" y="276" width="0.4811%" height="15" fill="rgb(217,147,25)" fg:x="12" fg:w="15"/><text x="0.6349%" y="286.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (15 samples, 0.48%)</title><rect x="0.3849%" y="292" width="0.4811%" height="15" fill="rgb(247,81,37)" fg:x="12" fg:w="15"/><text x="0.6349%" y="302.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (15 samples, 0.48%)</title><rect x="0.3849%" y="308" width="0.4811%" height="15" fill="rgb(209,12,38)" fg:x="12" fg:w="15"/><text x="0.6349%" y="318.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (15 samples, 0.48%)</title><rect x="0.3849%" y="324" width="0.4811%" height="15" fill="rgb(227,1,9)" fg:x="12" fg:w="15"/><text x="0.6349%" y="334.50"></text></g><g><title>__init__ (run_benchmark.py:237) (19 samples, 0.61%)</title><rect x="0.8659%" y="116" width="0.6094%" height="15" fill="rgb(248,47,43)" fg:x="27" fg:w="19"/><text x="1.1159%" y="126.50"></text></g><g><title>__init__ (run_benchmark.py:238) (11 samples, 0.35%)</title><rect x="1.4753%" y="116" width="0.3528%" height="15" fill="rgb(221,10,30)" fg:x="46" fg:w="11"/><text x="1.7253%" y="126.50"></text></g><g><title>bench_raytrace (run_benchmark.py:457) (50 samples, 1.60%)</title><rect x="0.8659%" y="100" width="1.6036%" height="15" fill="rgb(210,229,1)" fg:x="27" fg:w="50"/><text x="1.1159%" y="110.50"></text></g><g><title>__init__ (run_benchmark.py:239) (20 samples, 0.64%)</title><rect x="1.8281%" y="116" width="0.6414%" height="15" fill="rgb(222,148,37)" fg:x="57" fg:w="20"/><text x="2.0781%" y="126.50"></text></g><g><title>render (run_benchmark.py:327) (15 samples, 0.48%)</title><rect x="2.5016%" y="116" width="0.4811%" height="15" fill="rgb(234,67,33)" fg:x="78" fg:w="15"/><text x="2.7516%" y="126.50"></text></g><g><title>__init__ (run_benchmark.py:29) (11 samples, 0.35%)</title><rect x="5.9654%" y="132" width="0.3528%" height="15" fill="rgb(247,98,35)" fg:x="186" fg:w="11"/><text x="6.2154%" y="142.50"></text></g><g><title>render (run_benchmark.py:328) (121 samples, 3.88%)</title><rect x="2.9827%" y="116" width="3.8807%" height="15" fill="rgb(247,138,52)" fg:x="93" fg:w="121"/><text x="3.2327%" y="126.50">rend..</text></g><g><title>__init__ (run_benchmark.py:31) (17 samples, 0.55%)</title><rect x="6.3182%" y="132" width="0.5452%" height="15" fill="rgb(213,79,30)" fg:x="197" fg:w="17"/><text x="6.5682%" y="142.50"></text></g><g><title>render (run_benchmark.py:330) (11 samples, 0.35%)</title><rect x="6.8634%" y="116" width="0.3528%" height="15" fill="rgb(246,177,23)" fg:x="214" fg:w="11"/><text x="7.1134%" y="126.50"></text></g><g><title>normalized (run_benchmark.py:69) (6 samples, 0.19%)</title><rect x="11.0327%" y="148" width="0.1924%" height="15" fill="rgb(230,62,27)" fg:x="344" fg:w="6"/><text x="11.2827%" y="158.50"></text></g><g><title>normalized (run_benchmark.py:71) (29 samples, 0.93%)</title><rect x="11.2251%" y="148" width="0.9301%" height="15" fill="rgb(216,154,8)" fg:x="350" fg:w="29"/><text x="11.4751%" y="158.50"></text></g><g><title>__init__ (run_benchmark.py:29) (4 samples, 0.13%)</title><rect x="12.7646%" y="164" width="0.1283%" height="15" fill="rgb(244,35,45)" fg:x="398" fg:w="4"/><text x="13.0146%" y="174.50"></text></g><g><title>__init__ (run_benchmark.py:218) (90 samples, 2.89%)</title><rect x="10.1026%" y="132" width="2.8865%" height="15" fill="rgb(251,115,12)" fg:x="315" fg:w="90"/><text x="10.3526%" y="142.50">__..</text></g><g><title>normalized (run_benchmark.py:72) (26 samples, 0.83%)</title><rect x="12.1552%" y="148" width="0.8339%" height="15" fill="rgb(240,54,50)" fg:x="379" fg:w="26"/><text x="12.4052%" y="158.50"></text></g><g><title>rayColour (run_benchmark.py:335) (7 samples, 0.22%)</title><rect x="12.9891%" y="132" width="0.2245%" height="15" fill="rgb(233,84,52)" fg:x="405" fg:w="7"/><text x="13.2391%" y="142.50"></text></g><g><title>rayColour (run_benchmark.py:338) (8 samples, 0.26%)</title><rect x="13.2136%" y="132" width="0.2566%" height="15" fill="rgb(207,117,47)" fg:x="412" fg:w="8"/><text x="13.4636%" y="142.50"></text></g><g><title>rayColour (run_benchmark.py:346) (40 samples, 1.28%)</title><rect x="13.5343%" y="132" width="1.2829%" height="15" fill="rgb(249,43,39)" fg:x="422" fg:w="40"/><text x="13.7843%" y="142.50"></text></g><g><title>intersectionTime (run_benchmark.py:168) (13 samples, 0.42%)</title><rect x="20.1090%" y="148" width="0.4169%" height="15" fill="rgb(209,38,44)" fg:x="627" fg:w="13"/><text x="20.3590%" y="158.50"></text></g><g><title>intersectionTime (run_benchmark.py:169) (10 samples, 0.32%)</title><rect x="20.5260%" y="148" width="0.3207%" height="15" fill="rgb(236,212,23)" fg:x="640" fg:w="10"/><text x="20.7760%" y="158.50"></text></g><g><title>intersectionTime (run_benchmark.py:170) (30 samples, 0.96%)</title><rect x="20.8467%" y="148" width="0.9622%" height="15" fill="rgb(242,79,21)" fg:x="650" fg:w="30"/><text x="21.0967%" y="158.50"></text></g><g><title>intersectionTime (run_benchmark.py:171) (43 samples, 1.38%)</title><rect x="21.8089%" y="148" width="1.3791%" height="15" fill="rgb(211,96,35)" fg:x="680" fg:w="43"/><text x="22.0589%" y="158.50"></text></g><g><title>intersectionTime (run_benchmark.py:172) (23 samples, 0.74%)</title><rect x="23.1879%" y="148" width="0.7377%" height="15" fill="rgb(253,215,40)" fg:x="723" fg:w="23"/><text x="23.4379%" y="158.50"></text></g><g><title>intersectionTime (run_benchmark.py:173) (16 samples, 0.51%)</title><rect x="23.9256%" y="148" width="0.5131%" height="15" fill="rgb(211,81,21)" fg:x="746" fg:w="16"/><text x="24.1756%" y="158.50"></text></g><g><title>intersectionTime (run_benchmark.py:174) (118 samples, 3.78%)</title><rect x="24.4387%" y="148" width="3.7845%" height="15" fill="rgb(208,190,38)" fg:x="762" fg:w="118"/><text x="24.6887%" y="158.50">inte..</text></g><g><title>intersectionTime (run_benchmark.py:175) (35 samples, 1.12%)</title><rect x="28.2232%" y="148" width="1.1225%" height="15" fill="rgb(235,213,38)" fg:x="880" fg:w="35"/><text x="28.4732%" y="158.50"></text></g><g><title>intersectionTime (run_benchmark.py:176) (23 samples, 0.74%)</title><rect x="29.3457%" y="148" width="0.7377%" height="15" fill="rgb(237,122,38)" fg:x="915" fg:w="23"/><text x="29.5957%" y="158.50"></text></g><g><title>intersectionTime (run_benchmark.py:177) (152 samples, 4.87%)</title><rect x="30.0834%" y="148" width="4.8749%" height="15" fill="rgb(244,218,35)" fg:x="938" fg:w="152"/><text x="30.3334%" y="158.50">inters..</text></g><g><title>intersectionTime (run_benchmark.py:178) (32 samples, 1.03%)</title><rect x="34.9583%" y="148" width="1.0263%" height="15" fill="rgb(240,68,47)" fg:x="1090" fg:w="32"/><text x="35.2083%" y="158.50"></text></g><g><title>intersectionTime (run_benchmark.py:202) (7 samples, 0.22%)</title><rect x="36.0808%" y="148" width="0.2245%" height="15" fill="rgb(210,16,53)" fg:x="1125" fg:w="7"/><text x="36.3308%" y="158.50"></text></g><g><title>intersectionTime (run_benchmark.py:204) (14 samples, 0.45%)</title><rect x="36.3053%" y="148" width="0.4490%" height="15" fill="rgb(235,124,12)" fg:x="1132" fg:w="14"/><text x="36.5553%" y="158.50"></text></g><g><title>intersectionTime (run_benchmark.py:205) (4 samples, 0.13%)</title><rect x="36.7543%" y="148" width="0.1283%" height="15" fill="rgb(224,169,11)" fg:x="1146" fg:w="4"/><text x="37.0043%" y="158.50"></text></g><g><title>rayColour (run_benchmark.py:347) (692 samples, 22.19%)</title><rect x="14.8172%" y="132" width="22.1937%" height="15" fill="rgb(250,166,2)" fg:x="462" fg:w="692"/><text x="15.0672%" y="142.50">rayColour (run_benchmark.py:347)</text></g><g><title>intersectionTime (run_benchmark.py:206) (4 samples, 0.13%)</title><rect x="36.8826%" y="148" width="0.1283%" height="15" fill="rgb(242,216,29)" fg:x="1150" fg:w="4"/><text x="37.1326%" y="158.50"></text></g><g><title>rayColour (run_benchmark.py:348) (50 samples, 1.60%)</title><rect x="37.0109%" y="132" width="1.6036%" height="15" fill="rgb(230,116,27)" fg:x="1154" fg:w="50"/><text x="37.2609%" y="142.50"></text></g><g><title>rayColour (run_benchmark.py:349) (9 samples, 0.29%)</title><rect x="38.6145%" y="132" width="0.2886%" height="15" fill="rgb(228,99,48)" fg:x="1204" fg:w="9"/><text x="38.8645%" y="142.50"></text></g><g><title>rayColour (run_benchmark.py:351) (8 samples, 0.26%)</title><rect x="38.9031%" y="132" width="0.2566%" height="15" fill="rgb(253,11,6)" fg:x="1213" fg:w="8"/><text x="39.1531%" y="142.50"></text></g><g><title>rayColour (run_benchmark.py:354) (9 samples, 0.29%)</title><rect x="39.1918%" y="132" width="0.2886%" height="15" fill="rgb(247,143,39)" fg:x="1222" fg:w="9"/><text x="39.4418%" y="142.50"></text></g><g><title>rayColour (run_benchmark.py:356) (9 samples, 0.29%)</title><rect x="39.4804%" y="132" width="0.2886%" height="15" fill="rgb(236,97,10)" fg:x="1231" fg:w="9"/><text x="39.7304%" y="142.50"></text></g><g><title>rayColour (run_benchmark.py:357) (40 samples, 1.28%)</title><rect x="39.7691%" y="132" width="1.2829%" height="15" fill="rgb(233,208,19)" fg:x="1240" fg:w="40"/><text x="40.0191%" y="142.50"></text></g><g><title>pointAtTime (run_benchmark.py:226) (31 samples, 0.99%)</title><rect x="40.0577%" y="148" width="0.9942%" height="15" fill="rgb(216,164,2)" fg:x="1249" fg:w="31"/><text x="40.3077%" y="158.50"></text></g><g><title>__init__ (run_benchmark.py:122) (9 samples, 0.29%)</title><rect x="40.7633%" y="164" width="0.2886%" height="15" fill="rgb(220,129,5)" fg:x="1271" fg:w="9"/><text x="41.0133%" y="174.50"></text></g><g><title>__sub__ (run_benchmark.py:136) (5 samples, 0.16%)</title><rect x="42.5593%" y="180" width="0.1604%" height="15" fill="rgb(242,17,10)" fg:x="1327" fg:w="5"/><text x="42.8093%" y="190.50"></text></g><g><title>__init__ (run_benchmark.py:29) (8 samples, 0.26%)</title><rect x="43.1366%" y="196" width="0.2566%" height="15" fill="rgb(242,107,0)" fg:x="1345" fg:w="8"/><text x="43.3866%" y="206.50"></text></g><g><title>baseColourAt (run_benchmark.py:442) (33 samples, 1.06%)</title><rect x="42.3990%" y="164" width="1.0584%" height="15" fill="rgb(251,28,31)" fg:x="1322" fg:w="33"/><text x="42.6490%" y="174.50"></text></g><g><title>__sub__ (run_benchmark.py:137) (23 samples, 0.74%)</title><rect x="42.7197%" y="180" width="0.7377%" height="15" fill="rgb(233,223,10)" fg:x="1332" fg:w="23"/><text x="42.9697%" y="190.50"></text></g><g><title>colourAt (run_benchmark.py:399) (59 samples, 1.89%)</title><rect x="41.8538%" y="148" width="1.8922%" height="15" fill="rgb(215,21,27)" fg:x="1305" fg:w="59"/><text x="42.1038%" y="158.50">c..</text></g><g><title>baseColourAt (run_benchmark.py:444) (6 samples, 0.19%)</title><rect x="43.5536%" y="164" width="0.1924%" height="15" fill="rgb(232,23,21)" fg:x="1358" fg:w="6"/><text x="43.8036%" y="174.50"></text></g><g><title>normalized (run_benchmark.py:68) (4 samples, 0.13%)</title><rect x="45.2534%" y="180" width="0.1283%" height="15" fill="rgb(244,5,23)" fg:x="1411" fg:w="4"/><text x="45.5034%" y="190.50"></text></g><g><title>__init__ (run_benchmark.py:218) (41 samples, 1.31%)</title><rect x="44.6761%" y="164" width="1.3149%" height="15" fill="rgb(226,81,46)" fg:x="1393" fg:w="41"/><text x="44.9261%" y="174.50"></text></g><g><title>normalized (run_benchmark.py:72) (19 samples, 0.61%)</title><rect x="45.3817%" y="180" width="0.6094%" height="15" fill="rgb(247,70,30)" fg:x="1415" fg:w="19"/><text x="45.6317%" y="190.50"></text></g><g><title>__init__ (run_benchmark.py:29) (5 samples, 0.16%)</title><rect x="45.8307%" y="196" width="0.1604%" height="15" fill="rgb(212,68,19)" fg:x="1429" fg:w="5"/><text x="46.0807%" y="206.50"></text></g><g><title>reflectThrough (run_benchmark.py:102) (29 samples, 0.93%)</title><rect x="46.0552%" y="164" width="0.9301%" height="15" fill="rgb(240,187,13)" fg:x="1436" fg:w="29"/><text x="46.3052%" y="174.50"></text></g><g><title>__init__ (run_benchmark.py:29) (4 samples, 0.13%)</title><rect x="46.8570%" y="180" width="0.1283%" height="15" fill="rgb(223,113,26)" fg:x="1461" fg:w="4"/><text x="47.1070%" y="190.50"></text></g><g><title>reflectThrough (run_benchmark.py:96) (5 samples, 0.16%)</title><rect x="47.1135%" y="164" width="0.1604%" height="15" fill="rgb(206,192,2)" fg:x="1469" fg:w="5"/><text x="47.3635%" y="174.50"></text></g><g><title>colourAt (run_benchmark.py:403) (123 samples, 3.94%)</title><rect x="43.7460%" y="148" width="3.9448%" height="15" fill="rgb(241,108,4)" fg:x="1364" fg:w="123"/><text x="43.9960%" y="158.50">colo..</text></g><g><title>reflectThrough (run_benchmark.py:97) (13 samples, 0.42%)</title><rect x="47.2739%" y="164" width="0.4169%" height="15" fill="rgb(247,173,49)" fg:x="1474" fg:w="13"/><text x="47.5239%" y="174.50"></text></g><g><title>rayColour (run_benchmark.py:346) (11 samples, 0.35%)</title><rect x="48.0115%" y="164" width="0.3528%" height="15" fill="rgb(224,114,35)" fg:x="1497" fg:w="11"/><text x="48.2615%" y="174.50"></text></g><g><title>intersectionTime (run_benchmark.py:168) (18 samples, 0.58%)</title><rect x="49.3265%" y="180" width="0.5773%" height="15" fill="rgb(245,159,27)" fg:x="1538" fg:w="18"/><text x="49.5765%" y="190.50"></text></g><g><title>intersectionTime (run_benchmark.py:170) (10 samples, 0.32%)</title><rect x="49.9359%" y="180" width="0.3207%" height="15" fill="rgb(245,172,44)" fg:x="1557" fg:w="10"/><text x="50.1859%" y="190.50"></text></g><g><title>intersectionTime (run_benchmark.py:171) (4 samples, 0.13%)</title><rect x="50.2566%" y="180" width="0.1283%" height="15" fill="rgb(236,23,11)" fg:x="1567" fg:w="4"/><text x="50.5066%" y="190.50"></text></g><g><title>intersectionTime (run_benchmark.py:172) (12 samples, 0.38%)</title><rect x="50.3849%" y="180" width="0.3849%" height="15" fill="rgb(205,117,38)" fg:x="1571" fg:w="12"/><text x="50.6349%" y="190.50"></text></g><g><title>intersectionTime (run_benchmark.py:173) (5 samples, 0.16%)</title><rect x="50.7697%" y="180" width="0.1604%" height="15" fill="rgb(237,72,25)" fg:x="1583" fg:w="5"/><text x="51.0197%" y="190.50"></text></g><g><title>intersectionTime (run_benchmark.py:174) (17 samples, 0.55%)</title><rect x="50.9301%" y="180" width="0.5452%" height="15" fill="rgb(244,70,9)" fg:x="1588" fg:w="17"/><text x="51.1801%" y="190.50"></text></g><g><title>intersectionTime (run_benchmark.py:176) (12 samples, 0.38%)</title><rect x="51.5074%" y="180" width="0.3849%" height="15" fill="rgb(217,125,39)" fg:x="1606" fg:w="12"/><text x="51.7574%" y="190.50"></text></g><g><title>intersectionTime (run_benchmark.py:177) (32 samples, 1.03%)</title><rect x="51.8922%" y="180" width="1.0263%" height="15" fill="rgb(235,36,10)" fg:x="1618" fg:w="32"/><text x="52.1422%" y="190.50"></text></g><g><title>intersectionTime (run_benchmark.py:203) (6 samples, 0.19%)</title><rect x="53.0468%" y="180" width="0.1924%" height="15" fill="rgb(251,123,47)" fg:x="1654" fg:w="6"/><text x="53.2968%" y="190.50"></text></g><g><title>intersectionTime (run_benchmark.py:204) (6 samples, 0.19%)</title><rect x="53.2393%" y="180" width="0.1924%" height="15" fill="rgb(221,13,13)" fg:x="1660" fg:w="6"/><text x="53.4893%" y="190.50"></text></g><g><title>rayColour (run_benchmark.py:347) (160 samples, 5.13%)</title><rect x="48.3643%" y="164" width="5.1315%" height="15" fill="rgb(238,131,9)" fg:x="1508" fg:w="160"/><text x="48.6143%" y="174.50">rayCol..</text></g><g><title>rayColour (run_benchmark.py:348) (17 samples, 0.55%)</title><rect x="53.4958%" y="164" width="0.5452%" height="15" fill="rgb(211,50,8)" fg:x="1668" fg:w="17"/><text x="53.7458%" y="174.50"></text></g><g><title>baseColourAt (run_benchmark.py:442) (8 samples, 0.26%)</title><rect x="54.3618%" y="196" width="0.2566%" height="15" fill="rgb(245,182,24)" fg:x="1695" fg:w="8"/><text x="54.6118%" y="206.50"></text></g><g><title>__sub__ (run_benchmark.py:137) (5 samples, 0.16%)</title><rect x="54.4580%" y="212" width="0.1604%" height="15" fill="rgb(242,14,37)" fg:x="1698" fg:w="5"/><text x="54.7080%" y="222.50"></text></g><g><title>colourAt (run_benchmark.py:399) (11 samples, 0.35%)</title><rect x="54.3618%" y="180" width="0.3528%" height="15" fill="rgb(246,228,12)" fg:x="1695" fg:w="11"/><text x="54.6118%" y="190.50"></text></g><g><title>reflectThrough (run_benchmark.py:101) (5 samples, 0.16%)</title><rect x="54.7787%" y="196" width="0.1604%" height="15" fill="rgb(213,55,15)" fg:x="1708" fg:w="5"/><text x="55.0287%" y="206.50"></text></g><g><title>colourAt (run_benchmark.py:403) (12 samples, 0.38%)</title><rect x="54.7146%" y="180" width="0.3849%" height="15" fill="rgb(209,9,3)" fg:x="1706" fg:w="12"/><text x="54.9646%" y="190.50"></text></g><g><title>reflectThrough (run_benchmark.py:95) (4 samples, 0.13%)</title><rect x="54.9711%" y="196" width="0.1283%" height="15" fill="rgb(230,59,30)" fg:x="1714" fg:w="4"/><text x="55.2211%" y="206.50"></text></g><g><title>rayColour (run_benchmark.py:346) (5 samples, 0.16%)</title><rect x="55.0994%" y="196" width="0.1604%" height="15" fill="rgb(209,121,21)" fg:x="1718" fg:w="5"/><text x="55.3494%" y="206.50"></text></g><g><title>intersectionTime (run_benchmark.py:168) (5 samples, 0.16%)</title><rect x="55.3560%" y="212" width="0.1604%" height="15" fill="rgb(220,109,13)" fg:x="1726" fg:w="5"/><text x="55.6060%" y="222.50"></text></g><g><title>intersectionTime (run_benchmark.py:171) (5 samples, 0.16%)</title><rect x="55.5484%" y="212" width="0.1604%" height="15" fill="rgb(232,18,1)" fg:x="1732" fg:w="5"/><text x="55.7984%" y="222.50"></text></g><g><title>intersectionTime (run_benchmark.py:174) (12 samples, 0.38%)</title><rect x="55.7088%" y="212" width="0.3849%" height="15" fill="rgb(215,41,42)" fg:x="1737" fg:w="12"/><text x="55.9588%" y="222.50"></text></g><g><title>intersectionTime (run_benchmark.py:175) (4 samples, 0.13%)</title><rect x="56.0936%" y="212" width="0.1283%" height="15" fill="rgb(224,123,36)" fg:x="1749" fg:w="4"/><text x="56.3436%" y="222.50"></text></g><g><title>intersectionTime (run_benchmark.py:178) (4 samples, 0.13%)</title><rect x="56.3823%" y="212" width="0.1283%" height="15" fill="rgb(240,125,3)" fg:x="1758" fg:w="4"/><text x="56.6323%" y="222.50"></text></g><g><title>intersectionTime (run_benchmark.py:204) (5 samples, 0.16%)</title><rect x="56.5106%" y="212" width="0.1604%" height="15" fill="rgb(205,98,50)" fg:x="1762" fg:w="5"/><text x="56.7606%" y="222.50"></text></g><g><title>rayColour (run_benchmark.py:347) (52 samples, 1.67%)</title><rect x="55.2598%" y="196" width="1.6677%" height="15" fill="rgb(205,185,37)" fg:x="1723" fg:w="52"/><text x="55.5098%" y="206.50"></text></g><g><title>intersectionTime (run_benchmark.py:206) (5 samples, 0.16%)</title><rect x="56.7672%" y="212" width="0.1604%" height="15" fill="rgb(238,207,15)" fg:x="1770" fg:w="5"/><text x="57.0172%" y="222.50"></text></g><g><title>rayColour (run_benchmark.py:348) (4 samples, 0.13%)</title><rect x="56.9275%" y="196" width="0.1283%" height="15" fill="rgb(213,199,42)" fg:x="1775" fg:w="4"/><text x="57.1775%" y="206.50"></text></g><g><title>baseColourAt (run_benchmark.py:443) (10 samples, 0.32%)</title><rect x="57.3445%" y="228" width="0.3207%" height="15" fill="rgb(235,201,11)" fg:x="1788" fg:w="10"/><text x="57.5945%" y="238.50"></text></g><g><title>scale (run_benchmark.py:55) (5 samples, 0.16%)</title><rect x="57.5048%" y="244" width="0.1604%" height="15" fill="rgb(207,46,11)" fg:x="1793" fg:w="5"/><text x="57.7548%" y="254.50"></text></g><g><title>colourAt (run_benchmark.py:399) (15 samples, 0.48%)</title><rect x="57.3445%" y="212" width="0.4811%" height="15" fill="rgb(241,35,35)" fg:x="1788" fg:w="15"/><text x="57.5945%" y="222.50"></text></g><g><title>baseColourAt (run_benchmark.py:446) (5 samples, 0.16%)</title><rect x="57.6652%" y="228" width="0.1604%" height="15" fill="rgb(243,32,47)" fg:x="1798" fg:w="5"/><text x="57.9152%" y="238.50"></text></g><g><title>intersectionTime (run_benchmark.py:174) (9 samples, 0.29%)</title><rect x="58.0821%" y="244" width="0.2886%" height="15" fill="rgb(247,202,23)" fg:x="1811" fg:w="9"/><text x="58.3321%" y="254.50"></text></g><g><title>rayColour (run_benchmark.py:347) (21 samples, 0.67%)</title><rect x="57.8897%" y="228" width="0.6735%" height="15" fill="rgb(219,102,11)" fg:x="1805" fg:w="21"/><text x="58.1397%" y="238.50"></text></g><g><title>intersectionTime (run_benchmark.py:179) (5 samples, 0.16%)</title><rect x="58.4028%" y="244" width="0.1604%" height="15" fill="rgb(243,110,44)" fg:x="1821" fg:w="5"/><text x="58.6528%" y="254.50"></text></g><g><title>colourAt (run_benchmark.py:399) (4 samples, 0.13%)</title><rect x="58.5632%" y="244" width="0.1283%" height="15" fill="rgb(222,74,54)" fg:x="1826" fg:w="4"/><text x="58.8132%" y="254.50"></text></g><g><title>_lightIsVisible (run_benchmark.py:368) (6 samples, 0.19%)</title><rect x="58.7556%" y="276" width="0.1924%" height="15" fill="rgb(216,99,12)" fg:x="1832" fg:w="6"/><text x="59.0056%" y="286.50"></text></g><g><title>intersectionTime (run_benchmark.py:177) (4 samples, 0.13%)</title><rect x="58.8198%" y="292" width="0.1283%" height="15" fill="rgb(226,22,26)" fg:x="1834" fg:w="4"/><text x="59.0698%" y="302.50"></text></g><g><title>colourAt (run_benchmark.py:415) (9 samples, 0.29%)</title><rect x="58.6915%" y="244" width="0.2886%" height="15" fill="rgb(217,163,10)" fg:x="1830" fg:w="9"/><text x="58.9415%" y="254.50"></text></g><g><title>visibleLights (run_benchmark.py:376) (9 samples, 0.29%)</title><rect x="58.6915%" y="260" width="0.2886%" height="15" fill="rgb(213,25,53)" fg:x="1830" fg:w="9"/><text x="58.9415%" y="270.50"></text></g><g><title>colourAt (run_benchmark.py:404) (36 samples, 1.15%)</title><rect x="57.8576%" y="212" width="1.1546%" height="15" fill="rgb(252,105,26)" fg:x="1804" fg:w="36"/><text x="58.1076%" y="222.50"></text></g><g><title>rayColour (run_benchmark.py:358) (14 samples, 0.45%)</title><rect x="58.5632%" y="228" width="0.4490%" height="15" fill="rgb(220,39,43)" fg:x="1826" fg:w="14"/><text x="58.8132%" y="238.50"></text></g><g><title>_lightIsVisible (run_benchmark.py:366) (9 samples, 0.29%)</title><rect x="59.0122%" y="244" width="0.2886%" height="15" fill="rgb(229,68,48)" fg:x="1840" fg:w="9"/><text x="59.2622%" y="254.50"></text></g><g><title>__init__ (run_benchmark.py:218) (9 samples, 0.29%)</title><rect x="59.0122%" y="260" width="0.2886%" height="15" fill="rgb(252,8,32)" fg:x="1840" fg:w="9"/><text x="59.2622%" y="270.50"></text></g><g><title>normalized (run_benchmark.py:72) (4 samples, 0.13%)</title><rect x="59.1725%" y="276" width="0.1283%" height="15" fill="rgb(223,20,43)" fg:x="1845" fg:w="4"/><text x="59.4225%" y="286.50"></text></g><g><title>_lightIsVisible (run_benchmark.py:367) (5 samples, 0.16%)</title><rect x="59.3008%" y="244" width="0.1604%" height="15" fill="rgb(229,81,49)" fg:x="1849" fg:w="5"/><text x="59.5508%" y="254.50"></text></g><g><title>intersectionTime (run_benchmark.py:174) (4 samples, 0.13%)</title><rect x="59.4612%" y="260" width="0.1283%" height="15" fill="rgb(236,28,36)" fg:x="1854" fg:w="4"/><text x="59.7112%" y="270.50"></text></g><g><title>intersectionTime (run_benchmark.py:175) (8 samples, 0.26%)</title><rect x="59.5895%" y="260" width="0.2566%" height="15" fill="rgb(249,185,26)" fg:x="1858" fg:w="8"/><text x="59.8395%" y="270.50"></text></g><g><title>intersectionTime (run_benchmark.py:177) (7 samples, 0.22%)</title><rect x="59.8461%" y="260" width="0.2245%" height="15" fill="rgb(249,174,33)" fg:x="1866" fg:w="7"/><text x="60.0961%" y="270.50"></text></g><g><title>intersectionTime (run_benchmark.py:204) (6 samples, 0.19%)</title><rect x="60.0706%" y="260" width="0.1924%" height="15" fill="rgb(233,201,37)" fg:x="1873" fg:w="6"/><text x="60.3206%" y="270.50"></text></g><g><title>_lightIsVisible (run_benchmark.py:368) (27 samples, 0.87%)</title><rect x="59.4612%" y="244" width="0.8659%" height="15" fill="rgb(221,78,26)" fg:x="1854" fg:w="27"/><text x="59.7112%" y="254.50"></text></g><g><title>colourAt (run_benchmark.py:415) (45 samples, 1.44%)</title><rect x="59.0122%" y="212" width="1.4432%" height="15" fill="rgb(250,127,30)" fg:x="1840" fg:w="45"/><text x="59.2622%" y="222.50"></text></g><g><title>visibleLights (run_benchmark.py:376) (45 samples, 1.44%)</title><rect x="59.0122%" y="228" width="1.4432%" height="15" fill="rgb(230,49,44)" fg:x="1840" fg:w="45"/><text x="59.2622%" y="238.50"></text></g><g><title>_lightIsVisible (run_benchmark.py:369) (4 samples, 0.13%)</title><rect x="60.3271%" y="244" width="0.1283%" height="15" fill="rgb(229,67,23)" fg:x="1881" fg:w="4"/><text x="60.5771%" y="254.50"></text></g><g><title>colourAt (run_benchmark.py:404) (172 samples, 5.52%)</title><rect x="55.0994%" y="180" width="5.5164%" height="15" fill="rgb(249,83,47)" fg:x="1718" fg:w="172"/><text x="55.3494%" y="190.50">colourA..</text></g><g><title>rayColour (run_benchmark.py:358) (109 samples, 3.50%)</title><rect x="57.1199%" y="196" width="3.4958%" height="15" fill="rgb(215,43,3)" fg:x="1781" fg:w="109"/><text x="57.3699%" y="206.50">ray..</text></g><g><title>colourAt (run_benchmark.py:418) (5 samples, 0.16%)</title><rect x="60.4554%" y="212" width="0.1604%" height="15" fill="rgb(238,154,13)" fg:x="1885" fg:w="5"/><text x="60.7054%" y="222.50"></text></g><g><title>colourAt (run_benchmark.py:405) (6 samples, 0.19%)</title><rect x="60.6158%" y="180" width="0.1924%" height="15" fill="rgb(219,56,2)" fg:x="1890" fg:w="6"/><text x="60.8658%" y="190.50"></text></g><g><title>addColours (run_benchmark.py:382) (6 samples, 0.19%)</title><rect x="60.6158%" y="196" width="0.1924%" height="15" fill="rgb(233,0,4)" fg:x="1890" fg:w="6"/><text x="60.8658%" y="206.50"></text></g><g><title>visibleLights (run_benchmark.py:374) (6 samples, 0.19%)</title><rect x="60.8082%" y="196" width="0.1924%" height="15" fill="rgb(235,30,7)" fg:x="1896" fg:w="6"/><text x="61.0582%" y="206.50"></text></g><g><title>__init__ (run_benchmark.py:218) (12 samples, 0.38%)</title><rect x="61.3534%" y="228" width="0.3849%" height="15" fill="rgb(250,79,13)" fg:x="1913" fg:w="12"/><text x="61.6034%" y="238.50"></text></g><g><title>_lightIsVisible (run_benchmark.py:366) (19 samples, 0.61%)</title><rect x="61.2251%" y="212" width="0.6094%" height="15" fill="rgb(211,146,34)" fg:x="1909" fg:w="19"/><text x="61.4751%" y="222.50"></text></g><g><title>intersectionTime (run_benchmark.py:172) (6 samples, 0.19%)</title><rect x="62.2514%" y="228" width="0.1924%" height="15" fill="rgb(228,22,38)" fg:x="1941" fg:w="6"/><text x="62.5014%" y="238.50"></text></g><g><title>intersectionTime (run_benchmark.py:174) (13 samples, 0.42%)</title><rect x="62.4439%" y="228" width="0.4169%" height="15" fill="rgb(235,168,5)" fg:x="1947" fg:w="13"/><text x="62.6939%" y="238.50"></text></g><g><title>intersectionTime (run_benchmark.py:175) (5 samples, 0.16%)</title><rect x="62.8608%" y="228" width="0.1604%" height="15" fill="rgb(221,155,16)" fg:x="1960" fg:w="5"/><text x="63.1108%" y="238.50"></text></g><g><title>intersectionTime (run_benchmark.py:176) (10 samples, 0.32%)</title><rect x="63.0212%" y="228" width="0.3207%" height="15" fill="rgb(215,215,53)" fg:x="1965" fg:w="10"/><text x="63.2712%" y="238.50"></text></g><g><title>intersectionTime (run_benchmark.py:177) (7 samples, 0.22%)</title><rect x="63.3419%" y="228" width="0.2245%" height="15" fill="rgb(223,4,10)" fg:x="1975" fg:w="7"/><text x="63.5919%" y="238.50"></text></g><g><title>intersectionTime (run_benchmark.py:178) (5 samples, 0.16%)</title><rect x="63.5664%" y="228" width="0.1604%" height="15" fill="rgb(234,103,6)" fg:x="1982" fg:w="5"/><text x="63.8164%" y="238.50"></text></g><g><title>visibleLights (run_benchmark.py:376) (89 samples, 2.85%)</title><rect x="61.0006%" y="196" width="2.8544%" height="15" fill="rgb(227,97,0)" fg:x="1902" fg:w="89"/><text x="61.2506%" y="206.50">vi..</text></g><g><title>_lightIsVisible (run_benchmark.py:368) (60 samples, 1.92%)</title><rect x="61.9307%" y="212" width="1.9243%" height="15" fill="rgb(234,150,53)" fg:x="1931" fg:w="60"/><text x="62.1807%" y="222.50">_..</text></g><g><title>intersectionTime (run_benchmark.py:181) (4 samples, 0.13%)</title><rect x="63.7267%" y="228" width="0.1283%" height="15" fill="rgb(228,201,54)" fg:x="1987" fg:w="4"/><text x="63.9767%" y="238.50"></text></g><g><title>colourAt (run_benchmark.py:415) (100 samples, 3.21%)</title><rect x="60.8082%" y="180" width="3.2072%" height="15" fill="rgb(222,22,37)" fg:x="1896" fg:w="100"/><text x="61.0582%" y="190.50">col..</text></g><g><title>visibleLights (run_benchmark.py:377) (5 samples, 0.16%)</title><rect x="63.8550%" y="196" width="0.1604%" height="15" fill="rgb(237,53,32)" fg:x="1991" fg:w="5"/><text x="64.1050%" y="206.50"></text></g><g><title>normalAt (run_benchmark.py:185) (6 samples, 0.19%)</title><rect x="64.1758%" y="180" width="0.1924%" height="15" fill="rgb(233,25,53)" fg:x="2001" fg:w="6"/><text x="64.4258%" y="190.50"></text></g><g><title>rayColour (run_benchmark.py:358) (318 samples, 10.20%)</title><rect x="54.2335%" y="164" width="10.1988%" height="15" fill="rgb(210,40,34)" fg:x="1691" fg:w="318"/><text x="54.4835%" y="174.50">rayColour (run_..</text></g><g><title>colourAt (run_benchmark.py:404) (535 samples, 17.16%)</title><rect x="47.6908%" y="148" width="17.1584%" height="15" fill="rgb(241,220,44)" fg:x="1487" fg:w="535"/><text x="47.9408%" y="158.50">colourAt (run_benchmark.py:..</text></g><g><title>rayColour (run_benchmark.py:360) (13 samples, 0.42%)</title><rect x="64.4323%" y="164" width="0.4169%" height="15" fill="rgb(235,28,35)" fg:x="2009" fg:w="13"/><text x="64.6823%" y="174.50"></text></g><g><title>addColours (run_benchmark.py:383) (5 samples, 0.16%)</title><rect x="65.0738%" y="164" width="0.1604%" height="15" fill="rgb(210,56,17)" fg:x="2029" fg:w="5"/><text x="65.3238%" y="174.50"></text></g><g><title>colourAt (run_benchmark.py:405) (25 samples, 0.80%)</title><rect x="64.8493%" y="148" width="0.8018%" height="15" fill="rgb(224,130,29)" fg:x="2022" fg:w="25"/><text x="65.0993%" y="158.50"></text></g><g><title>addColours (run_benchmark.py:384) (13 samples, 0.42%)</title><rect x="65.2341%" y="164" width="0.4169%" height="15" fill="rgb(235,212,8)" fg:x="2034" fg:w="13"/><text x="65.4841%" y="174.50"></text></g><g><title>colourAt (run_benchmark.py:407) (8 samples, 0.26%)</title><rect x="65.6511%" y="148" width="0.2566%" height="15" fill="rgb(223,33,50)" fg:x="2047" fg:w="8"/><text x="65.9011%" y="158.50"></text></g><g><title>colourAt (run_benchmark.py:411) (13 samples, 0.42%)</title><rect x="65.9076%" y="148" width="0.4169%" height="15" fill="rgb(219,149,13)" fg:x="2055" fg:w="13"/><text x="66.1576%" y="158.50"></text></g><g><title>colourAt (run_benchmark.py:413) (4 samples, 0.13%)</title><rect x="66.3246%" y="148" width="0.1283%" height="15" fill="rgb(250,156,29)" fg:x="2068" fg:w="4"/><text x="66.5746%" y="158.50"></text></g><g><title>colourAt (run_benchmark.py:414) (7 samples, 0.22%)</title><rect x="66.4529%" y="148" width="0.2245%" height="15" fill="rgb(216,193,19)" fg:x="2072" fg:w="7"/><text x="66.7029%" y="158.50"></text></g><g><title>visibleLights (run_benchmark.py:375) (15 samples, 0.48%)</title><rect x="66.9660%" y="164" width="0.4811%" height="15" fill="rgb(216,135,14)" fg:x="2088" fg:w="15"/><text x="67.2160%" y="174.50"></text></g><g><title>__init__ (run_benchmark.py:217) (16 samples, 0.51%)</title><rect x="69.0827%" y="196" width="0.5131%" height="15" fill="rgb(241,47,5)" fg:x="2154" fg:w="16"/><text x="69.3327%" y="206.50"></text></g><g><title>normalized (run_benchmark.py:68) (4 samples, 0.13%)</title><rect x="69.6280%" y="212" width="0.1283%" height="15" fill="rgb(233,42,35)" fg:x="2171" fg:w="4"/><text x="69.8780%" y="222.50"></text></g><g><title>normalized (run_benchmark.py:71) (22 samples, 0.71%)</title><rect x="69.7563%" y="212" width="0.7056%" height="15" fill="rgb(231,13,6)" fg:x="2175" fg:w="22"/><text x="70.0063%" y="222.50"></text></g><g><title>__init__ (run_benchmark.py:218) (44 samples, 1.41%)</title><rect x="69.5959%" y="196" width="1.4112%" height="15" fill="rgb(207,181,40)" fg:x="2170" fg:w="44"/><text x="69.8459%" y="206.50"></text></g><g><title>normalized (run_benchmark.py:72) (17 samples, 0.55%)</title><rect x="70.4618%" y="212" width="0.5452%" height="15" fill="rgb(254,173,49)" fg:x="2197" fg:w="17"/><text x="70.7118%" y="222.50"></text></g><g><title>__init__ (run_benchmark.py:31) (5 samples, 0.16%)</title><rect x="70.8467%" y="228" width="0.1604%" height="15" fill="rgb(221,1,38)" fg:x="2209" fg:w="5"/><text x="71.0967%" y="238.50"></text></g><g><title>__init__ (run_benchmark.py:29) (5 samples, 0.16%)</title><rect x="71.0071%" y="196" width="0.1604%" height="15" fill="rgb(206,124,46)" fg:x="2214" fg:w="5"/><text x="71.2571%" y="206.50"></text></g><g><title>__init__ (run_benchmark.py:30) (5 samples, 0.16%)</title><rect x="71.1674%" y="196" width="0.1604%" height="15" fill="rgb(249,21,11)" fg:x="2219" fg:w="5"/><text x="71.4174%" y="206.50"></text></g><g><title>_lightIsVisible (run_benchmark.py:366) (114 samples, 3.66%)</title><rect x="67.7357%" y="180" width="3.6562%" height="15" fill="rgb(222,201,40)" fg:x="2112" fg:w="114"/><text x="67.9857%" y="190.50">_lig..</text></g><g><title>_lightIsVisible (run_benchmark.py:367) (24 samples, 0.77%)</title><rect x="71.3919%" y="180" width="0.7697%" height="15" fill="rgb(235,61,29)" fg:x="2226" fg:w="24"/><text x="71.6419%" y="190.50"></text></g><g><title>intersectionTime (run_benchmark.py:168) (34 samples, 1.09%)</title><rect x="75.4650%" y="196" width="1.0904%" height="15" fill="rgb(219,207,3)" fg:x="2353" fg:w="34"/><text x="75.7150%" y="206.50"></text></g><g><title>intersectionTime (run_benchmark.py:169) (12 samples, 0.38%)</title><rect x="76.5555%" y="196" width="0.3849%" height="15" fill="rgb(222,56,46)" fg:x="2387" fg:w="12"/><text x="76.8055%" y="206.50"></text></g><g><title>intersectionTime (run_benchmark.py:170) (18 samples, 0.58%)</title><rect x="76.9403%" y="196" width="0.5773%" height="15" fill="rgb(239,76,54)" fg:x="2399" fg:w="18"/><text x="77.1903%" y="206.50"></text></g><g><title>intersectionTime (run_benchmark.py:171) (13 samples, 0.42%)</title><rect x="77.5176%" y="196" width="0.4169%" height="15" fill="rgb(231,124,27)" fg:x="2417" fg:w="13"/><text x="77.7676%" y="206.50"></text></g><g><title>intersectionTime (run_benchmark.py:172) (23 samples, 0.74%)</title><rect x="77.9346%" y="196" width="0.7377%" height="15" fill="rgb(249,195,6)" fg:x="2430" fg:w="23"/><text x="78.1846%" y="206.50"></text></g><g><title>intersectionTime (run_benchmark.py:173) (17 samples, 0.55%)</title><rect x="78.6722%" y="196" width="0.5452%" height="15" fill="rgb(237,174,47)" fg:x="2453" fg:w="17"/><text x="78.9222%" y="206.50"></text></g><g><title>intersectionTime (run_benchmark.py:174) (63 samples, 2.02%)</title><rect x="79.2174%" y="196" width="2.0205%" height="15" fill="rgb(206,201,31)" fg:x="2470" fg:w="63"/><text x="79.4674%" y="206.50">i..</text></g><g><title>intersectionTime (run_benchmark.py:175) (13 samples, 0.42%)</title><rect x="81.2380%" y="196" width="0.4169%" height="15" fill="rgb(231,57,52)" fg:x="2533" fg:w="13"/><text x="81.4880%" y="206.50"></text></g><g><title>intersectionTime (run_benchmark.py:176) (24 samples, 0.77%)</title><rect x="81.6549%" y="196" width="0.7697%" height="15" fill="rgb(248,177,22)" fg:x="2546" fg:w="24"/><text x="81.9049%" y="206.50"></text></g><g><title>intersectionTime (run_benchmark.py:177) (95 samples, 3.05%)</title><rect x="82.4246%" y="196" width="3.0468%" height="15" fill="rgb(215,211,37)" fg:x="2570" fg:w="95"/><text x="82.6746%" y="206.50">int..</text></g><g><title>intersectionTime (run_benchmark.py:178) (16 samples, 0.51%)</title><rect x="85.4715%" y="196" width="0.5131%" height="15" fill="rgb(241,128,51)" fg:x="2665" fg:w="16"/><text x="85.7215%" y="206.50"></text></g><g><title>intersectionTime (run_benchmark.py:179) (6 samples, 0.19%)</title><rect x="85.9846%" y="196" width="0.1924%" height="15" fill="rgb(227,165,31)" fg:x="2681" fg:w="6"/><text x="86.2346%" y="206.50"></text></g><g><title>intersectionTime (run_benchmark.py:202) (8 samples, 0.26%)</title><rect x="86.2733%" y="196" width="0.2566%" height="15" fill="rgb(228,167,24)" fg:x="2690" fg:w="8"/><text x="86.5233%" y="206.50"></text></g><g><title>intersectionTime (run_benchmark.py:205) (8 samples, 0.26%)</title><rect x="86.5619%" y="196" width="0.2566%" height="15" fill="rgb(228,143,12)" fg:x="2699" fg:w="8"/><text x="86.8119%" y="206.50"></text></g><g><title>_lightIsVisible (run_benchmark.py:368) (469 samples, 15.04%)</title><rect x="72.1616%" y="180" width="15.0417%" height="15" fill="rgb(249,149,8)" fg:x="2250" fg:w="469"/><text x="72.4116%" y="190.50">_lightIsVisible (run_be..</text></g><g><title>intersectionTime (run_benchmark.py:206) (12 samples, 0.38%)</title><rect x="86.8185%" y="196" width="0.3849%" height="15" fill="rgb(243,35,44)" fg:x="2707" fg:w="12"/><text x="87.0685%" y="206.50"></text></g><g><title>visibleLights (run_benchmark.py:376) (624 samples, 20.01%)</title><rect x="67.4471%" y="164" width="20.0128%" height="15" fill="rgb(246,89,9)" fg:x="2103" fg:w="624"/><text x="67.6971%" y="174.50">visibleLights (run_benchmark.py..</text></g><g><title>_lightIsVisible (run_benchmark.py:371) (5 samples, 0.16%)</title><rect x="87.2996%" y="180" width="0.1604%" height="15" fill="rgb(233,213,13)" fg:x="2722" fg:w="5"/><text x="87.5496%" y="190.50"></text></g><g><title>colourAt (run_benchmark.py:415) (655 samples, 21.01%)</title><rect x="66.6774%" y="148" width="21.0071%" height="15" fill="rgb(233,141,41)" fg:x="2079" fg:w="655"/><text x="66.9274%" y="158.50">colourAt (run_benchmark.py:415)</text></g><g><title>visibleLights (run_benchmark.py:377) (7 samples, 0.22%)</title><rect x="87.4599%" y="164" width="0.2245%" height="15" fill="rgb(239,167,4)" fg:x="2727" fg:w="7"/><text x="87.7099%" y="174.50"></text></g><g><title>colourAt (run_benchmark.py:417) (7 samples, 0.22%)</title><rect x="87.6844%" y="148" width="0.2245%" height="15" fill="rgb(209,217,16)" fg:x="2734" fg:w="7"/><text x="87.9344%" y="158.50"></text></g><g><title>colourAt (run_benchmark.py:419) (4 samples, 0.13%)</title><rect x="87.9089%" y="148" width="0.1283%" height="15" fill="rgb(219,88,35)" fg:x="2741" fg:w="4"/><text x="88.1589%" y="158.50"></text></g><g><title>colourAt (run_benchmark.py:421) (4 samples, 0.13%)</title><rect x="88.0693%" y="148" width="0.1283%" height="15" fill="rgb(220,193,23)" fg:x="2746" fg:w="4"/><text x="88.3193%" y="158.50"></text></g><g><title>colourAt (run_benchmark.py:423) (8 samples, 0.26%)</title><rect x="88.1976%" y="148" width="0.2566%" height="15" fill="rgb(230,90,52)" fg:x="2750" fg:w="8"/><text x="88.4476%" y="158.50"></text></g><g><title>colourAt (run_benchmark.py:424) (8 samples, 0.26%)</title><rect x="88.4541%" y="148" width="0.2566%" height="15" fill="rgb(252,106,19)" fg:x="2758" fg:w="8"/><text x="88.7041%" y="158.50"></text></g><g><title>addColours (run_benchmark.py:382) (7 samples, 0.22%)</title><rect x="88.9673%" y="164" width="0.2245%" height="15" fill="rgb(206,74,20)" fg:x="2774" fg:w="7"/><text x="89.2173%" y="174.50"></text></g><g><title>colourAt (run_benchmark.py:426) (18 samples, 0.58%)</title><rect x="88.7107%" y="148" width="0.5773%" height="15" fill="rgb(230,138,44)" fg:x="2766" fg:w="18"/><text x="88.9607%" y="158.50"></text></g><g><title>colourAt (run_benchmark.py:429) (22 samples, 0.71%)</title><rect x="89.3201%" y="148" width="0.7056%" height="15" fill="rgb(235,182,43)" fg:x="2785" fg:w="22"/><text x="89.5701%" y="158.50"></text></g><g><title>addColours (run_benchmark.py:382) (8 samples, 0.26%)</title><rect x="89.7691%" y="164" width="0.2566%" height="15" fill="rgb(242,16,51)" fg:x="2799" fg:w="8"/><text x="90.0191%" y="174.50"></text></g><g><title>normalAt (run_benchmark.py:188) (12 samples, 0.38%)</title><rect x="90.0257%" y="148" width="0.3849%" height="15" fill="rgb(248,9,4)" fg:x="2807" fg:w="12"/><text x="90.2757%" y="158.50"></text></g><g><title>rayColour (run_benchmark.py:358) (1,545 samples, 49.55%)</title><rect x="41.0520%" y="132" width="49.5510%" height="15" fill="rgb(210,31,22)" fg:x="1280" fg:w="1545"/><text x="41.3020%" y="142.50">rayColour (run_benchmark.py:358)</text></g><g><title>normalAt (run_benchmark.py:211) (6 samples, 0.19%)</title><rect x="90.4105%" y="148" width="0.1924%" height="15" fill="rgb(239,54,39)" fg:x="2819" fg:w="6"/><text x="90.6605%" y="158.50"></text></g><g><title>render (run_benchmark.py:331) (2,613 samples, 83.80%)</title><rect x="7.2162%" y="116" width="83.8037%" height="15" fill="rgb(230,99,41)" fg:x="225" fg:w="2613"/><text x="7.4662%" y="126.50">render (run_benchmark.py:331)</text></g><g><title>rayColour (run_benchmark.py:360) (13 samples, 0.42%)</title><rect x="90.6030%" y="132" width="0.4169%" height="15" fill="rgb(253,106,12)" fg:x="2825" fg:w="13"/><text x="90.8530%" y="142.50"></text></g><g><title>plot (run_benchmark.py:245) (31 samples, 0.99%)</title><rect x="92.3348%" y="132" width="0.9942%" height="15" fill="rgb(213,46,41)" fg:x="2879" fg:w="31"/><text x="92.5848%" y="142.50"></text></g><g><title>plot (run_benchmark.py:246) (56 samples, 1.80%)</title><rect x="93.3291%" y="132" width="1.7960%" height="15" fill="rgb(215,133,35)" fg:x="2910" fg:w="56"/><text x="93.5791%" y="142.50">p..</text></g><g><title>plot (run_benchmark.py:247) (68 samples, 2.18%)</title><rect x="95.1251%" y="132" width="2.1809%" height="15" fill="rgb(213,28,5)" fg:x="2966" fg:w="68"/><text x="95.3751%" y="142.50">p..</text></g><g><title>&lt;module&gt; (bench_driver.py:84) (3,107 samples, 99.65%)</title><rect x="0.2566%" y="68" width="99.6472%" height="15" fill="rgb(215,77,49)" fg:x="8" fg:w="3107"/><text x="0.5066%" y="78.50">&lt;module&gt; (bench_driver.py:84)</text></g><g><title>main (bench_driver.py:74) (3,088 samples, 99.04%)</title><rect x="0.8659%" y="84" width="99.0378%" height="15" fill="rgb(248,100,22)" fg:x="27" fg:w="3088"/><text x="1.1159%" y="94.50">main (bench_driver.py:74)</text></g><g><title>bench_raytrace (run_benchmark.py:469) (3,037 samples, 97.40%)</title><rect x="2.5016%" y="100" width="97.4022%" height="15" fill="rgb(208,67,9)" fg:x="78" fg:w="3037"/><text x="2.7516%" y="110.50">bench_raytrace (run_benchmark.py:469)</text></g><g><title>render (run_benchmark.py:332) (277 samples, 8.88%)</title><rect x="91.0199%" y="116" width="8.8839%" height="15" fill="rgb(219,133,21)" fg:x="2838" fg:w="277"/><text x="91.2699%" y="126.50">render (run_b..</text></g><g><title>plot (run_benchmark.py:248) (81 samples, 2.60%)</title><rect x="97.3060%" y="132" width="2.5978%" height="15" fill="rgb(246,46,29)" fg:x="3034" fg:w="81"/><text x="97.5560%" y="142.50">pl..</text></g><g><title>all (3,118 samples, 100%)</title><rect x="0.0000%" y="52" width="100.0000%" height="15" fill="rgb(246,185,52)" fg:x="0" fg:w="3118"/><text x="0.2500%" y="62.50"></text></g></svg></svg>

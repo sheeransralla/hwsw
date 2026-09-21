@@ -1,0 +1,82 @@
+=== sorted by tottime (time inside the function itself) ===
+Fri Sep 18 15:35:21 2026    /root/hwsw-project/raytrace/results/cprofile_original.prof
+
+         3086309 function calls (3079432 primitive calls) in 1.891 seconds
+
+   Ordered by: internal time
+   List reduced from 52 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+   509871    0.321    0.000    0.387    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:51(dot)
+   277865    0.274    0.000    0.408    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:113(__sub__)
+   179457    0.227    0.000    0.759    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:142(intersectionTime)
+   452943    0.154    0.000    0.154    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:24(__init__)
+    10666    0.116    0.000    0.876    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:283(_lightIsVisible)
+   149743    0.093    0.000    0.144    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:48(scale)
+   109887    0.081    0.000    0.358    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:61(normalized)
+   109887    0.072    0.000    0.172    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:35(magnitude)
+   520539    0.067    0.000    0.067    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:76(mustBeVector)
+    15265    0.064    0.000    0.536    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:271(<listcomp>)
+    98172    0.058    0.000    0.378    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:177(__init__)
+5333/3789    0.047    0.000    1.296    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:315(colourAt)
+        1    0.045    0.045    1.887    1.887 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:245(render)
+   277865    0.039    0.000    0.039    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:122(isPoint)
+15333/10000    0.038    0.000    1.706    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:266(rayColour)
+    10000    0.028    0.000    0.044    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:200(plot)
+    20000    0.021    0.000    0.030    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:38(__add__)
+    15265    0.019    0.000    0.019    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:213(firstIntersection)
+    25501    0.016    0.000    0.035    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:164(intersectionTime)
+   116821    0.016    0.000    0.016    0.000 {built-in method math.sqrt}
+     3857    0.011    0.000    0.023    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:346(baseColourAt)
+     5333    0.011    0.000    0.889    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:290(visibleLights)
+    15999    0.011    0.000    0.011    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:298(addColours)
+    35333    0.011    0.000    0.011    0.000 {built-in method builtins.min}
+     5333    0.008    0.000    0.032    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:82(reflectThrough)
+    30000    0.008    0.000    0.008    0.000 {built-in method builtins.max}
+     5333    0.006    0.000    0.010    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:109(__add__)
+     5333    0.006    0.000    0.008    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:44(__sub__)
+     5333    0.006    0.000    0.021    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:184(pointAtTime)
+        1    0.003    0.003    0.003    0.003 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:193(__init__)
+
+
+=== sorted by cumtime (time including callees) ===
+Fri Sep 18 15:35:21 2026    /root/hwsw-project/raytrace/results/cprofile_original.prof
+
+         3086309 function calls (3079432 primitive calls) in 1.891 seconds
+
+   Ordered by: cumulative time
+   List reduced from 52 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000    1.891    1.891 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:357(bench_raytrace)
+        1    0.045    0.045    1.887    1.887 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:245(render)
+15333/10000    0.038    0.000    1.706    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:266(rayColour)
+5333/3789    0.047    0.000    1.296    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:315(colourAt)
+     5333    0.011    0.000    0.889    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:290(visibleLights)
+    10666    0.116    0.000    0.876    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:283(_lightIsVisible)
+   179457    0.227    0.000    0.759    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:142(intersectionTime)
+    15265    0.064    0.000    0.536    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:271(<listcomp>)
+   277865    0.274    0.000    0.408    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:113(__sub__)
+   509871    0.321    0.000    0.387    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:51(dot)
+    98172    0.058    0.000    0.378    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:177(__init__)
+   109887    0.081    0.000    0.358    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:61(normalized)
+   109887    0.072    0.000    0.172    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:35(magnitude)
+   452943    0.154    0.000    0.154    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:24(__init__)
+   149743    0.093    0.000    0.144    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:48(scale)
+   520539    0.067    0.000    0.067    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:76(mustBeVector)
+    10000    0.028    0.000    0.044    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:200(plot)
+   277865    0.039    0.000    0.039    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:122(isPoint)
+    25501    0.016    0.000    0.035    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:164(intersectionTime)
+     5333    0.008    0.000    0.032    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:82(reflectThrough)
+    20000    0.021    0.000    0.030    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:38(__add__)
+     3857    0.011    0.000    0.023    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:346(baseColourAt)
+     5333    0.006    0.000    0.021    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:184(pointAtTime)
+    15265    0.019    0.000    0.019    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:213(firstIntersection)
+   116821    0.016    0.000    0.016    0.000 {built-in method math.sqrt}
+    15999    0.011    0.000    0.011    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:298(addColours)
+    35333    0.011    0.000    0.011    0.000 {built-in method builtins.min}
+     5333    0.006    0.000    0.010    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:109(__add__)
+     1476    0.001    0.000    0.009    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:151(normalAt)
+     5333    0.006    0.000    0.008    0.000 /root/hwsw-project/raytrace/bm_raytrace/run_benchmark.py:44(__sub__)
+
+

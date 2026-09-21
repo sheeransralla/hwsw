@@ -1,0 +1,13 @@
+=== pyperf compare_to (baseline -> optimized) ===
++-----------+----------+----------------------+
+| Benchmark | baseline | optimized            |
++===========+==========+======================+
+| raytrace  | 799 ms   | 308 ms: 2.59x faster |
++-----------+----------+----------------------+
+
+=== summary ===
+baseline :    798.6 ms +- 8.5 ms (120 values)
+optimized:    307.8 ms +- 1.9 ms (120 values)
+time reduction: 61.5 %
+speedup       : 2.59x
+target (course): at least 7 % improvement -> met
