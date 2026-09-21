@@ -1,0 +1,1135 @@
+================================================================================
+                    HWSW PROJECT - BENCHMARK REPORT: RAYTRACE
+================================================================================
+
+Benchmark : raytrace (pyperformance, bm_raytrace/run_benchmark.py)
+Scene     : 8 objects, 2 light sources, rendered at 100 x 100 pixels
+
+Contents
+  1. Overview
+  2. Initial Analysis
+  3. Optimizations
+  4. Performance Comparison
+  5. Hardware Acceleration Proposal
+  6. Conclusion
+
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+1.1 Purpose of the benchmark
+----------------------------
+raytrace renders a small scene with a ray tracer written entirely in Python.
+No numerical or graphics library takes part in the computation: the vector
+arithmetic, the ray-object intersections, the shading and the reflections are
+all executed by the interpreter. The workload is CPU-bound and
+single-threaded.
+
+The benchmark stresses a different part of the interpreter than pyflate. Its
+work consists of many short operations on small objects:
+
+  - creation of many short-lived objects (operations such as vector scaling
+    and point subtraction each return a new object),
+  - method calls and attribute lookups on those objects,
+  - floating-point arithmetic on Python floats, each of which is itself an
+    object,
+  - repeated linear searches over the scene's objects, one per ray,
+  - nested loops over pixels, objects and light sources.
+
+Where pyflate is dominated by integer and bit manipulation and by per-byte
+loops, raytrace is dominated by object allocation and call overhead. Together
+the two benchmarks cover the two typical cost profiles of interpreted code,
+which is why they were chosen as a pair.
+
+The rendered image is written to a PPM file only when a filename is given, and
+the benchmark does not verify its output. An equivalence check was therefore
+written for this project: check_output.py renders the scene with two versions
+of the benchmark and compares the MD5 digests of the resulting images (see
+2.1).
+
+1.2 Workload (measured)
+-----------------------
+The scene is built once per loop: one large sphere, six small spheres arranged
+in a row, one infinite halfspace acting as a checkerboard floor, and two point
+lights. One loop renders the whole 100 x 100 image.
+
+All values below are deterministic: they depend only on the scene and the
+image size, not on the machine or the Python version. They were collected by
+instrumenting the benchmark (characterize_raytrace.py).
+
+    Image .................................... 100 x 100 = 10,000 pixels
+    Objects in the scene ..................... 8 (7 spheres, 1 halfspace)
+    Light sources ............................ 2
+
+    Rays cast ................................ 15,333
+      primary rays (one per pixel) ........... 10,000
+      reflection rays ........................ 5,333
+    Maximum reflection depth ................. 4 levels
+    Shadow rays (light visibility tests) ..... 10,666
+      of which the light is visible .......... 10,236
+
+    Intersection tests ....................... 204,958 (20.5 per pixel)
+      against spheres ........................ 179,457
+        returned an intersection time ........ 6,934
+        of those, in front of the ray ........ 3,298
+      against the halfspace .................. 25,501
+        returned an intersection time ........ 25,501
+        of those, in front of the ray ........ 3,957
+
+    Objects tested per shadow ray ............ 7.77 of 8
+      (the scan stops at the first obstruction; most shadow rays are
+       unobstructed and therefore test every object)
+
+    Objects created .......................... 556,460 (55.6 per pixel)
+      Vector ................................. 452,943
+      Ray .................................... 98,172
+      Point .................................. 5,345
+
+    Vector operations
+      dot .................................... 509,871
+      Point.__sub__ .......................... 277,865
+      scale .................................. 149,743
+      normalized / magnitude ................. 109,887 each
+      Vector.__add__ ......................... 20,000
+
+The halfspace returns a value for every test because its intersection formula
+divides by the dot product of the ray direction and the plane normal, which is
+nonzero unless the ray runs parallel to the plane; the caller then discards
+the times that fall behind the ray.
+
+Two properties shape the performance analysis. The renderer creates 556,460
+Vector, Ray and Point objects per image, about 56 per pixel. Operations such
+as vector scaling and point subtraction contribute to these temporary objects.
+It also performs 179,457 sphere intersection tests, of which 6,934 return an
+intersection time. Thus about 96% of sphere tests end in the miss path, making
+its cost especially important.
+
+
+1.3 Libraries and dependencies
+------------------------------
+
+Standard library:
+
+  math     - Provides math.sqrt() for vector magnitude and sphere
+             intersection calculations, and math.pi and math.tan() for
+             the camera's field-of-view calculation. math.sqrt() is
+             called 116,821 times per benchmark loop.
+
+  array    - array.array('B', ...) stores the canvas as one byte per
+             colour channel. For a 100 x 100 RGB image, the buffer holds
+             30,000 bytes. Canvas.plot() writes three channel values per
+             pixel, and write_ppm() can write the buffer to a PPM file.
+
+Third-party libraries:
+
+  pyperf   - Provides the measurement harness. A pyperf.Runner registers
+             bench_raytrace() using bench_time_func(). It performs
+             calibration and warmup runs, launches worker processes, and
+             collects repeated timing values. bench_raytrace() measures
+             elapsed time with pyperf.perf_counter() and returns it to
+             the harness, which reports the mean and standard deviation
+             across runs.
+
+             The image dimensions and output filename are exposed through
+             --width, --height and --filename. The defaults are 100 x 100
+             pixels with no output file written, and the dimensions are
+             recorded in each result file's metadata.
+
+  pyperformance
+           - The benchmark suite that packages and launches bm_raytrace
+             and manages its benchmark environment and dependencies.
+
+No numerical or graphics library performs the ray-tracing computation.
+Vector operations, intersection tests, shading and reflections are
+implemented in the benchmark's Python code. Some individual operations
+used by that code execute in native standard-library or built-in code,
+including math.sqrt(), array operations, min(), max() and int().
+
+Unlike pyflate, raytrace contains no built-in correctness check. With the
+default arguments it does not write the rendered image, and it does not
+verify the canvas contents. This project therefore uses an external
+equivalence test, check_output.py, as described in Section 2.1.
+
+
+1.4 Program structure and execution flow
+----------------------------------------
+
+One benchmark loop constructs the fixed scene and renders a complete
+100 x 100 image. With the default arguments, the result remains in the
+canvas buffer and is not written to disk.
+
+  bench_raytrace(loops, width, height, filename)
+    start timer
+
+    repeat loops times:
+      create the canvas                    100 x 100 RGB buffer
+      construct the camera and scene
+        add 7 spheres
+        add 1 checkerboard halfspace
+        add 2 point lights
+
+      render(canvas)
+        compute the camera basis from the field of view
+        for each of the 10,000 pixels:
+          compute the pixel's direction from the camera
+          construct a primary Ray
+          rayColour(ray)
+            if the recursion depth exceeds 3:
+              return black immediately
+            test the ray against every scene object
+              Sphere.intersectionTime(ray)
+              Halfspace.intersectionTime(ray)
+            firstIntersection()
+              select the nearest valid forward intersection
+
+            if no object is hit:
+              return the background colour
+
+            otherwise:
+              compute the intersection point and surface normal
+              colourAt(...)
+                baseColourAt(point)
+                  return the sphere colour, or the floor's
+                  checkerboard colour
+
+                if the surface is specular:
+                  compute the reflected direction
+                  construct a reflection Ray
+                  call rayColour() recursively
+                  add the reflected colour, scaled by the
+                  specular coefficient
+
+                if the surface is diffuse:
+                  visibleLights(point)
+                    for each of the two lights:
+                      _lightIsVisible(point, light)
+                        construct a shadow ray toward the light
+                        test scene objects for an obstruction,
+                        stopping at the first one found
+                  sum each visible light's contribution, the dot
+                  product of the normal and the direction to the
+                  light, and add the base colour scaled by it
+
+                add the base colour scaled by the ambient
+                coefficient
+
+          Canvas.plot(x, y, colour)
+            clamp and convert the RGB components to bytes
+            store them in the canvas array
+
+    stop timer
+
+    if an output filename was supplied:
+      write the canvas as a PPM image
+
+    return elapsed time
+
+The recursion terminates at the entry of rayColour(): the surface code starts
+a reflection whenever the surface is specular, and the depth test returns
+black once four levels have been entered. The canvas and the scene are
+rebuilt inside the timed loop, so their construction is part of the measured
+work; at 8 objects this is negligible against 10,000 rendered pixels.
+
+
+1.5 Algorithms
+--------------
+
+(a) Camera and primary-ray generation
+
+The camera defines a viewing plane using two perpendicular vectors:
+vpRight for horizontal movement and vpUp for vertical movement. The field
+of view determines the size of this plane. For every pixel, render()
+computes its position on the viewing plane and creates a normalized ray
+from the camera through that position. A 100 x 100 image therefore starts
+with 10,000 primary rays.
+
+(b) Ray-sphere intersection
+
+Substituting the ray into the sphere equation produces a quadratic equation.
+The discriminant determines whether the ray intersects the sphere:
+
+    discriminant < 0    no intersection
+    discriminant = 0    one tangent intersection
+    discriminant > 0    two possible intersections
+
+The implementation returns the nearer root, v - sqrt(discriminant), without
+checking whether it is positive. The caller later discards intersection times
+that fall too far behind the ray. Approximately 96% of the sphere tests have
+a negative discriminant and return without constructing an intersection.
+
+(c) Ray-halfspace intersection
+
+The floor is represented by a Halfspace. Its implementation computes:
+
+    v = ray.vector.dot(normal)
+    if v:
+        return 1 / -v
+
+Thus it returns a value for every ray not parallel to the plane. This is not
+the general ray-plane intersection equation: it uses neither the ray origin
+nor a point on the plane. For this scene the plane passes through the origin
+with an upward normal, so the correct time for a ray from p in direction d is
+-p.y / d.y, while the code returns -1 / d.y. The two agree only when the ray
+origin lies one unit from the plane. This limitation is recorded in
+Section 1.8.
+
+(d) Nearest-hit selection
+
+rayColour() obtains a candidate intersection time from every object.
+firstIntersection() retains candidates satisfying:
+
+    candidateT > -EPSILON
+
+It then returns the object with the smallest retained time. The negative
+threshold tolerates intersections slightly behind the ray origin, probably
+to reduce floating-point boundary problems, while rejecting more negative
+values.
+
+(e) Surface shading
+
+colourAt() combines:
+
+  ambient   - a constant contribution independent of direct illumination;
+  diffuse   - light reflected according to the angle between the surface
+              normal and each visible-light direction;
+  specular  - the colour returned by a recursively traced reflection ray,
+              scaled by the material's specular coefficient (see (g)).
+
+Despite its name, the specular term is mirror reflection rather than a local
+Phong-style highlight.
+
+(f) Shadow rays and visible lights
+
+For each light, the renderer casts a shadow ray from the surface point toward
+that light. _lightIsVisible() tests whether another object intersects this ray
+before it reaches the light. If so, the light is blocked and contributes
+nothing to the direct shading; otherwise, it is included by visibleLights().
+A small EPSILON test prevents the surface from falsely shadowing itself. Any
+intersection is treated as blocking, without checking whether it lies between
+the surface and the light.
+
+(g) Reflection and recursion
+
+A reflective surface produces a new direction by reflecting the incoming ray
+around the surface normal. A new ray is traced from the intersection point,
+and its colour is blended with the local surface colour. Reflected rays may
+produce further reflections, but recursion stops at a maximum depth of four
+to guarantee termination and limit the amount of work.
+
+(h) Checkerboard surface
+
+The floor colour is selected using:
+
+    int(abs(x) + 0.5) + int(abs(y) + 0.5) + int(abs(z) + 0.5)
+
+The parity of this sum selects one of the two checkerboard colours. The code
+calls v.scale(1.0 / checkSize), but scale() returns a new Vector and the
+result is discarded. Consequently, checkSize has no effect and the pattern
+always uses unit-scale coordinates. This is harmless for the default
+checkSize of 1, but is recorded as an implementation issue in Section 1.8.
+
+
+1.6 Main data structures
+------------------------
+
+  Vector and Point     Objects containing x, y and z coordinates. They do
+                       not use __slots__, so every instance also has an
+                       attribute dictionary. One benchmark loop creates
+                       452,943 Vector objects and 5,345 Point objects.
+
+  Ray                  Contains an origin Point and a direction Vector. Its
+                       constructor normalizes the direction, creating more
+                       temporary vectors and calling magnitude() and
+                       math.sqrt(). A total of 98,172 Ray objects are
+                       constructed per benchmark loop.
+
+  Scene.objects        A Python list containing eight (object, surface)
+                       pairs: seven spheres and one halfspace. The list is
+                       scanned linearly when searching for intersections.
+
+  Scene.lightPoints    A list containing the two Point objects that represent
+                       the scene's light positions.
+
+  Canvas.bytes         An array.array('B') containing the RGB image. At
+                       100 x 100 pixels and three channels per pixel, it
+                       occupies 30,000 data bytes. It is the program's main
+                       compact, contiguous data structure.
+
+  intersections        A temporary list of candidate intersections constructed
+                       inside rayColour(). Each list contains one entry per
+                       scene object, a tuple of (object, time, surface), and
+                       is searched for the nearest valid hit. The list
+                       comprehension runs 15,265 times per benchmark loop and
+                       allocates about 122,000 tuples.
+
+  surfaces             Eight SimpleSurface or CheckerboardSurface objects, one
+                       per scene object, holding the base colour and the
+                       ambient, diffuse and specular coefficients used in
+                       1.5(e).
+
+
+1.7 Candidate costs to investigate
+----------------------------------
+
+Code inspection suggests the following possible bottlenecks. The counts are
+the measured per-loop figures from 1.2.
+
+  H1. Cost of a single intersection test
+      A sphere test performs a point subtraction, two dot products and, when
+      the discriminant is non-negative, a square root. The scene is tested
+      204,958 times per loop, and 96% of the 179,457 sphere tests end in the
+      miss path, so the cost of a test that finds nothing dominates.
+
+  H2. Temporary geometry objects
+      Operations such as point subtraction, vector scaling and normalization
+      create new Vector, Point or Ray objects: 556,460 per loop, about 56 per
+      pixel. Each allocation initializes a Python object and its attributes,
+      even when the value is used only once.
+
+  H3. Fine-grained vector method calls
+      Basic arithmetic is divided among methods such as dot() (509,871
+      calls), Point.__sub__() (277,865), scale() (149,743) and normalized()
+      (109,887). A single geometric calculation therefore involves several
+      Python calls and attribute lookups in addition to its floating-point
+      operations.
+
+  H4. Materialization of intersection lists
+      rayColour() builds a list of intersection records for all scene objects
+      before firstIntersection() selects the nearest one: 15,265 lists and
+      about 122,000 tuples per loop. Most of this temporary data may be
+      unnecessary if the nearest valid intersection is tracked during the
+      scan.
+
+  H5. Number of secondary rays
+      Each visible surface can generate a shadow ray per light and a
+      recursive reflection ray. For 10,000 pixels the renderer casts 5,333
+      reflection rays and 10,666 shadow rays, each of which repeats the
+      linear scan over the scene's objects.
+
+  H6. Per-pixel Python loops
+      render() processes every pixel in nested Python loops, computes a ray
+      and converts the resulting colour to three canvas bytes. This fixed
+      overhead may become important after the geometry operations are
+      improved.
+
+  H7. No-op type assertions
+      dot(), __sub__() and cross() call other.mustBeVector(), whose body is
+      "return self", and Point.__sub__() calls other.isPoint() to choose its
+      return type: 520,539 and 277,865 calls per loop. These checks perform
+      no computation but cost a Python call on every vector operation.
+
+Scene construction and optional PPM output are not expected to dominate. The
+scene contains only eight objects and is constructed once per benchmark loop,
+while no image file is written with the default arguments. These hypotheses
+are tested against the flame graph and profiling data in Section 2.
+
+
+1.8 Relevant implementation limitations
+---------------------------------------
+
+  - The benchmark does not verify its output. With the default arguments,
+    the image is not written to a file, so an optimization that changes a
+    pixel would go unnoticed. This project therefore compares the output of
+    the original and optimized versions using check_output.py (see 2.1).
+
+  - Halfspace.intersectionTime() returns 1 / -v, where v is the dot product
+    of the ray direction and the surface normal. It ignores the ray origin
+    and plane position, so it is not a general ray-plane intersection
+    formula. The implementation assumes that the missing numerator is one.
+    It is preserved because the original rendered image defines the required
+    benchmark output.
+
+  - Sphere.intersectionTime() returns only the nearer quadratic root. If this
+    root is behind the ray but the farther root is ahead, the valid farther
+    intersection is not considered. This can affect rays starting inside a
+    sphere, although that case is not important in the default scene.
+
+  - CheckerboardSurface.baseColourAt() calls
+    v.scale(1.0 / checkSize) but discards the returned Vector. Therefore
+    checkSize has no effect. This is harmless for the default value of one.
+
+  - _lightIsVisible() treats every intersection with t > EPSILON as an
+    obstruction without checking whether it occurs before the light.
+    Consequently, an object located beyond a light could incorrectly cast
+    a shadow. This case does not occur in the default scene.
+
+  - mustBeVector() and mustBePoint() are called frequently, but their
+    successful paths only return the object or a constant. They therefore
+    add type-checking call overhead without contributing to the geometric
+    calculation.
+
+  - Some error paths raise string values, which is invalid in Python 3 and
+    would produce TypeError instead of the intended error. These paths are
+    not reached by the benchmark workload.
+
+
+================================================================================
+2. INITIAL ANALYSIS
+================================================================================
+
+2.1 Environment and measurement method
+--------------------------------------
+The environment, tools and measurement method are those described in the
+pyflate report (section 2.1) and are summarized here.
+
+  Host .................. Technion course server naranja10
+  Virtualization ........ QEMU with KVM acceleration, 4 GB RAM, 1 virtual CPU
+  Guest OS .............. Ubuntu 22.04 cloud image, Linux 5.15.0-1101-kvm
+  Interpreter (timing) .. CPython 3.10.12, release build (python3)
+  Interpreter (perf) .... CPython 3.10.12, debug build (python3-dbg)
+  Benchmark tools ....... pyperformance 1.14.0, pyperf 2.10.0
+  Profiling tools ....... cProfile, py-spy 0.4.2, Linux perf,
+                          Brendan Gregg's FlameGraph scripts
+
+The runs were managed by script_raytrace.sh, which has the same stages as the
+pyflate script: baseline measures the unmodified benchmark with pyperformance,
+profile collects cProfile, perf and flame-graph data, and optimized and
+compare measure and compare the optimized copy. Timing uses the release
+interpreter; the perf profile uses the debug build, whose symbols show
+CPython's internal C functions. As in pyflate, perf samples the software
+cpu-clock event, because the virtual CPU exposes no usable hardware
+performance counters.
+
+Profiling is performed outside the pyperf harness: bench_driver.py imports
+run_benchmark.py and calls bench_raytrace() directly, so the profiles contain
+only rendering work.
+
+Background CPU activity was disabled before measuring, as described in the
+pyflate report; the CPU was confirmed idle with top before every run.
+
+Correctness checking
+  Unlike pyflate, raytrace verifies nothing about its output (see 1.8). Every
+  optimization in Section 3 is therefore checked with check_output.py, which
+  renders the scene with the original and the optimized benchmark, writes both
+  images as PPM files and compares their MD5 digests. An optimization that
+  changes any pixel fails this check even if the benchmark still runs and
+  reports a shorter time. The reference digest for the default 100 x 100 scene
+  is f3c700588a9b6320fb1e46027142f205 (30,015 bytes).
+
+2.2 Baseline results
+--------------------
+
+The unmodified benchmark was measured with pyperformance in rigorous mode
+on the release interpreter:
+
+  Mean +- std dev ......... 799 ms +- 8 ms
+  Median +- MAD ........... 798 ms +- 4 ms
+  Minimum / maximum ....... 787 ms / 867 ms
+  Measured values ......... 120 (40 runs x 3 values, 1 loop per value)
+
+The standard deviation is about 1% of the mean, and the median is close to
+the mean. The maximum of 867 ms is a single outlier, 9% above the mean, while
+the 95th percentile lies within 1%. This baseline is the reference for the
+optimization comparison in Section 4.
+
+2.3 Flame graphs and profiling
+------------------------------
+
+The py-spy flame graph profiles the release interpreter over five rendered
+images (raytrace/results/pyspy_original.svg). Unlike pyflate, no single stage
+dominates: the time is spread across the vector arithmetic that every stage
+uses. Sampled self time by function:
+
+  dot .................................................. 16.5%
+  Vector.__init__ ...................................... 14.1%
+  intersectionTime ..................................... 13.2%
+  __sub__ .............................................. 12.4%
+  _lightIsVisible ...................................... 6.9%
+  scale ................................................ 4.8%
+  intersection list comprehension ...................... 4.5%
+  render ............................................... 4.2%
+  Canvas.plot .......................................... 3.7%
+  rayColour / colourAt ................................. 5.5%
+  normalized / magnitude ............................... 5.0%
+
+Including callees, render accounts for 97.1%, rayColour for 83.4%, colourAt
+for 58.9%, visibleLights for 39.7% and intersectionTime for 37.5%.
+
+The line-level data identifies two lines that perform no computation:
+
+  dot:52       other.mustBeVector() .................... 5.0%
+  __sub__:114  if other.isPoint(): ..................... 2.8%
+
+Together these type checks account for about 8% of runtime.
+
+cProfile confirms the call counts for one rendered image: 3,086,309 Python
+function calls, of which
+
+  dot ..................... 509,871 calls
+  mustBeVector ............ 520,539 calls
+  Vector.__init__ ......... 452,943 calls
+  Point.__sub__ ........... 277,865 calls
+  isPoint ................. 277,865 calls
+  intersectionTime ........ 179,457 calls (spheres)
+  scale ................... 149,743 calls
+  normalized / magnitude .. 109,887 calls each
+  Ray.__init__ ............  98,172 calls
+
+The perf profile of the debug interpreter shows which native mechanisms this
+workload exercises. Grouping its symbols:
+
+  bytecode interpreter loop (_PyEval_EvalFrameDefault) ... 28.3%
+  function-call machinery (call_function, frame_dealloc,
+    _PyEval_MakeFrameVector, _PyEval_Vector,
+    _PyObject_VectorcallTstate) .......................... about 13%
+  attribute and dictionary lookups (_PyDict_GetItemHint,
+    lookdict_unicode_nodummy, _PyType_Lookup,
+    lookdict_split, _PyObject_GetMethod) ................. about 9%
+  float arithmetic (binary_op1) and tuple access
+    (PyTuple_GetItem) .................................... about 4%
+
+In the pyflate profile the same call and lookup groups accounted for about 6%
+and 4%, with list operations dominating instead. The comparison confirms that
+the two benchmarks stress different parts of the interpreter. As in pyflate,
+the perf flame graph's call hierarchy is unusable because the CPython build
+omits frame pointers; its per-symbol percentages are unaffected.
+
+2.4 Identified bottlenecks
+--------------------------
+
+The measurements confirm most of the expectations in 1.7 and correct their
+ranking.
+
+1. Vector arithmetic and object creation (about 54% of self time)
+   dot, __sub__, scale, normalized, magnitude, __add__ and Vector.__init__
+   together account for roughly 54% of sampled self time. The cost is not the
+   floating-point arithmetic, which is a handful of multiplications per call,
+   but the Python call and the object it returns: 556,460 objects are created
+   per image. This confirms H2 and H3, which turn out to be two views of the
+   same cost.
+
+2. Intersection testing (37.5% including callees, 13.2% self)
+   intersectionTime is called 204,958 times per image and 96% of the sphere
+   tests miss. Its own cost is modest; most of its time is spent in the vector
+   operations it calls. H1 is confirmed, but the way to make it cheaper is to
+   reduce the work per test rather than the number of tests.
+
+3. Secondary rays (visibleLights 39.7% including callees)
+   Shadow and reflection rays repeat the whole intersection search. With
+   10,666 shadow rays and 5,333 reflection rays for 10,000 pixels, more than a
+   third of the work is spent on rays that are not primary. H5 is confirmed.
+
+4. No-op type assertions (about 8%)
+   mustBeVector() and isPoint() are called 798,404 times per image and compute
+   nothing. H7 is confirmed and is the cheapest available saving.
+
+5. Per-pixel loop and canvas writes (about 8%)
+   render and Canvas.plot together account for about 8% of self time. H6 is
+   confirmed as a secondary cost that becomes relatively more important once
+   the geometry is faster.
+
+6. Intersection lists (4.5% self)
+   The list comprehension in rayColour builds 15,265 lists and about 122,000
+   tuples per image. H4 is confirmed as a real but smaller cost.
+
+Unlike pyflate, where a single line accounted for 17% of runtime, no single
+change will dominate here: the work is spread across many small operations
+that are individually cheap and collectively expensive. The optimizations in
+Section 3 therefore target the per-operation overhead itself rather than any
+one stage.
+
+
+================================================================================
+3. OPTIMIZATIONS
+================================================================================
+
+The optimizations were applied to a separate copy of the benchmark
+(raytrace/bm_raytrace_opt/run_benchmark.py); the original remains unchanged
+for comparison. Because the benchmark verifies nothing about its output (see
+1.8), every step was checked with check_output.py before it was measured: the
+original and the optimized version render the scene and their images are
+compared by MD5 digest. All five steps produce the digest of the unmodified
+benchmark, f3c700588a9b6320fb1e46027142f205.
+
+No step changes the ray-tracing algorithm or scene. Where arithmetic was
+inlined, the original evaluation order was preserved so that floating-point
+rounding would not alter intersection decisions or pixel values. Exact output
+equivalence was confirmed by the image digest after every step.
+
+The changes were applied cumulatively. After each step, the output was
+verified and the new version was measured before the next optimization was
+added. Each reported percentage is therefore the incremental reduction
+relative to the preceding step. The speedups come from pyperformance
+measurements, not from profiler runtimes.
+
+3.1 Slots and removal of no-op type checks
+-------------------------------------------
+Two changes to the Vector and Point classes:
+
+  - __slots__ = ('x', 'y', 'z') on both classes. The benchmark creates
+    458,288 of these objects per image; without __slots__ each carries its
+    own attribute dictionary.
+  - dot(), Vector.__sub__() and cross() called other.mustBeVector() on every
+    invocation. For a Vector argument the whole body of that method is
+    "return self": it performs no computation. Removing these calls removes
+    515,206 of the 520,539 mustBeVector() calls per image; the remaining ones
+    are in Point.__add__(). Point.__sub__() calls isPoint() to choose its
+    return type and was left unchanged.
+
+Result: 16.7% less time than the baseline.
+
+3.2 Inlined intersection and normalization arithmetic
+------------------------------------------------------
+The geometry functions were rewritten to work on coordinates instead of
+constructing intermediate vectors:
+
+  - Sphere.intersectionTime() built cp = centre - ray.point as a Vector and
+    called dot() twice. Both are now computed from the coordinates directly.
+    This function runs 179,457 times per image and 96% of those calls end in
+    the miss path, so the saving applies mostly to tests that find nothing.
+  - Halfspace.intersectionTime() inlines its single dot product (25,501
+    calls).
+  - normalized() called magnitude(), which called dot(), and then scale():
+    four Python calls and two objects for one operation. It now computes one
+    square root and returns one Vector (109,887 calls).
+  - math.sqrt is bound once at module level as sqrt, removing an attribute
+    lookup from the two call sites that run 116,821 times per image.
+
+Result: 27.2% less time than step 1.
+
+3.3 Nearest-hit tracking and shadow-ray construction
+-----------------------------------------------------
+Two changes in the Scene class:
+
+  - rayColour() built a list of (object, time, surface) tuples for all eight
+    scene objects and then called firstIntersection() to scan it: 15,265
+    lists and about 122,000 tuples per image. The nearest valid hit is now
+    tracked while the objects are scanned. The selection rule is unchanged:
+    the smallest time greater than -EPSILON, keeping the first object on a
+    tie.
+  - _lightIsVisible() constructed the same shadow ray repeatedly inside
+    the object loop. It now constructs the ray once before that loop.
+    Shadow-ray constructions fall from 82,839 to 10,666 per image, removing
+    72,173 Ray constructions and their associated normalizations.
+
+Result: 31.8% less time than step 2.
+
+3.4 Per-pixel loop and canvas writes
+-------------------------------------
+In render(), the components of eye.vector, vpRight and vpUp are held in local
+variables, the y component of the pixel direction is computed once per row
+instead of once per pixel (saving 9,900 scale() calls), the two vector
+additions are inlined in their original order, and self.rayColour and
+canvas.plot are looked up once instead of once per pixel. Canvas.plot() reads
+self.bytes once instead of three times.
+
+Result: 6.7% less time than step 3.
+
+3.5 Inlined shading helpers
+----------------------------
+The remaining vector operations in the shading path were inlined in the same
+way as step 2:
+
+  - reflectThrough(): normal.scale(self.dot(normal)) followed by
+    self - d.scale(2), previously three temporary vectors, is now one.
+  - pointAtTime(): point + vector.scale(t), one temporary removed per hit.
+  - Sphere.normalAt(): (p - centre).normalized(), two temporaries removed.
+  - the diffuse term in colourAt(): (lightPoint - p).normalized().dot(normal)
+    is computed from coordinates, with p and the normal hoisted out of the
+    loop over visible lights.
+
+Result: 7.8% less time than step 4.
+
+3.6 Optimizations considered and not adopted
+---------------------------------------------
+
+  - Replacing the implementation with a numerical or graphics library was
+    not adopted because it would move the main computation from Python into
+    native library code and substantially change the workload being studied.
+
+  - A spatial acceleration structure such as a BVH was considered. The scene
+    contains only eight objects, so additional tree construction, traversal
+    and Python object overhead may outweigh the reduction in intersection
+    tests. This project instead focused on reducing the measured overhead of
+    the existing linear traversal.
+
+  - Thread-based rendering would not run the CPU-bound Python bytecode in
+    parallel under CPython's global interpreter lock. Multiprocessing could
+    distribute pixels across processes, but would add process-management and
+    communication costs and change the benchmark structure.
+
+
+================================================================================
+4. PERFORMANCE COMPARISON
+================================================================================
+
+All measurements use pyperformance in rigorous mode with the release
+interpreter, 120 measured values per result, under the conditions described in
+2.1. The optimized benchmark is run with --same-loops, so each measured value
+covers the same amount of work as the baseline. Every result was preceded by a
+successful run of check_output.py, so each timing below belongs to a version
+that renders exactly the original image.
+
+  step                              mean         gain over    cumulative
+                                                 previous     speedup
+  baseline                     798.6 ms +- 8.5       -           1.00x
+  1  slots, no-op type checks  665.2 ms +- 5.0     16.7%         1.20x
+  2  inlined geometry math     484.0 ms +- 3.5     27.2%         1.65x
+  3  nearest hit, shadow rays  329.9 ms +- 1.9     31.8%         2.42x
+  4  render loop and plot      307.8 ms +- 1.9      6.7%         2.59x
+  5  inlined shading helpers   283.8 ms +- 2.2      7.8%         2.81x
+
+Overall: 798.6 ms -> 283.8 ms, a reduction of 64.5% (2.81x). The project
+requires an improvement of at least 7%.
+
+The result is far outside the measurement noise. The standard deviation falls
+from 1.1% of the mean at the baseline to 0.8% at the end, and the two
+distributions are far apart: the baseline's fastest value is 787 ms while the
+optimized version's slowest is 291 ms. pyperf compare_to reports every step as
+significant.
+
+The largest incremental saving occurred in step 3. _lightIsVisible()
+constructed the same shadow ray repeatedly inside its loop over scene
+objects. Moving the construction outside the loop reduces shadow-Ray
+constructions from 82,839 to 10,666 per image, eliminating 72,173 Ray
+objects and their associated normalizations.
+
+Step 3 also removes the temporary intersection lists and tuples. Because
+these two changes were measured together, their individual speedups cannot
+be determined from the full-benchmark result. The construction counts and
+the original profile nevertheless indicate that shadow-ray hoisting is the
+larger contributor. This illustrates that a profile shows where time is
+spent, while source inspection is needed to determine why.
+
+Profile of the optimized version
+--------------------------------
+The final version, whose unprofiled pyperformance mean is 283.8 ms, was
+profiled again with py-spy under the same profiling configuration as the
+original.
+
+  function                         optimized   baseline
+  intersectionTime                    38.2%       13.2%
+  rayColour                           12.0%        2.9%
+  Canvas.plot                          8.9%        3.7%
+  _lightIsVisible                      6.9%        6.9%
+  colourAt                             6.6%        2.6%
+  constructors (__init__)              6.2%       14.1%
+  render                               5.4%        4.2%
+  normalized                           2.7%        2.6%
+
+The optimized profile is more concentrated. intersectionTime now performs
+the coordinate arithmetic directly instead of delegating it to dot() and
+__sub__(), and accounts for 38.2% of sampled self time. Its increased share
+does not mean that it became slower: the total program became much faster,
+so the intersection arithmetic represents a larger fraction of the
+remaining execution time.
+
+Constructor self time fell from 14.1% to 6.2% as temporary geometry objects
+were removed. Canvas.plot and rayColour also occupy larger relative shares
+because earlier overheads were reduced. Including callees, rayColour accounts
+for 75.3% of the optimized profile, colourAt for 47.3%, visibleLights for
+24.1% and _lightIsVisible for 22.0%; these inclusive values overlap.
+
+The remaining intersection path performs primarily Python floating-point
+arithmetic and comparisons. It no longer allocates the temporary Vector
+objects used by the original implementation, although Python arithmetic
+still creates float objects internally. This concentrated, repeated
+intersection calculation motivates the hardware proposal in Section 5.
+
+Result files in the repository:
+  baseline.json, opt_step1_slots.json, opt_step2_inline.json,
+  opt_step3_rays.json, opt_step4_render.json, opt_step5_shading.json
+  comparison_step1_slots.txt ... comparison_step5_shading.txt
+  run_benchmark_step1_slots.py ... run_benchmark_step5_shading.py
+  flamegraph_original.svg, flamegraph_optimized.svg,
+  pyspy_original.svg, pyspy_optimized.svg,
+  cprofile_original.txt, cprofile_optimized.txt,
+  perf_top_symbols_original.txt, perf_top_symbols_optimized.txt
+
+
+================================================================================
+5. HARDWARE ACCELERATION PROPOSAL
+================================================================================
+
+5.1 Choice of component
+-----------------------
+In the optimized benchmark, intersectionTime() accounts for 38.2% of sampled
+self time. rayColour() and _lightIsVisible() account for another 18.9%, part
+of which is the object-scan and selection control that the accelerator also
+replaces. The computation is a short, fixed sequence of floating-point
+operations repeated 204,958 times per image, with no data dependence between
+one test and the next. That combination - a large share, a fixed arithmetic
+recipe and full independence between instances - is what makes it a hardware
+candidate.
+
+Two alternatives were considered and rejected on the measurements:
+
+  - A dot-product unit. A dot product is three multiplications and two
+    additions; any interface crossing costs far more than that. After the
+    software optimizations there are also almost no dot() calls left, because
+    the arithmetic was inlined into intersectionTime() (see 3.2).
+
+  - A vector normalization unit. normalized() accounts for 2.7% of runtime,
+    so by Amdahl's law the ceiling is 1/(1-0.027) = 1.03x even with
+    infinitely fast hardware. A fast inverse square root of the kind used in
+    real-time graphics is also an approximation, and any change to a pixel
+    would fail the equivalence check that Section 3 relies on.
+
+The accelerator therefore takes a whole ray and returns the selected hit for
+the whole scene, rather than accelerating one intersection test. This matters
+for the interface: the benchmark performs 204,958 intersection tests per image
+but casts only 25,999 rays, so testing the scene in hardware reduces the
+number of host interactions by a factor of eight.
+
+5.2 Function
+------------
+The accelerator holds the scene locally (seven spheres and one halfspace) and
+implements the search of Scene.rayColour() and Scene._lightIsVisible() in two
+modes:
+
+  MODE_NEAREST  test every object, keep the smallest t with t > -EPSILON and,
+                on a tie, the object that comes first - the rule of
+                firstIntersection().
+  MODE_ANYHIT   stop at the first object with t > EPSILON and report it - the
+                early exit of _lightIsVisible().
+
+The arithmetic follows the benchmark exactly, in the same evaluation order:
+
+    cp   = centre - origin
+    v    = (cp.x*d.x + cp.y*d.y) + cp.z*d.z
+    c2   = (cp.x*cp.x + cp.y*cp.y) + cp.z*cp.z
+    disc = r*r - (c2 - v*v)
+    t    = v - sqrt(disc)                          (sphere)
+    t    = 1 / -((d.x*n.x + d.y*n.y) + d.z*n.z)    (halfspace)
+
+The order matters: a mathematically equivalent rearrangement such as
+(r*r + v*v) - c2 would round differently, and because the sign of disc decides
+whether the ray hits, a difference in the last bits can change a pixel.
+
+5.3 Interfaces
+--------------
+  scene load     sph_we, sph_idx[2:0], sph_cx/cy/cz/r (4 x 64 bits)
+                 hs_we, hs_nx/ny/nz (3 x 64 bits)
+                 cfg_we, cfg_epsilon (64 bits)
+  ray request    req_valid / req_ready handshake, req_mode,
+                 req_ox/oy/oz, req_dx/dy/dz (6 x 64 bits)
+  result         res_valid / res_ready handshake, res_hit,
+                 res_obj[3:0] (0..6 spheres, 7 halfspace, 15 none),
+                 res_t (64 bits)
+  clock, reset   single clock domain, active-low reset; 100 MHz assumed
+
+All data is IEEE-754 binary64, because the accelerator must reproduce CPython
+float arithmetic; a narrower format would change intersection decisions.
+
+In a system this would sit behind a command FIFO and a result FIFO, so the
+host can submit a batch of independent rays instead of blocking on each one.
+Primary rays are known in advance and can be submitted as one large batch.
+Shadow rays become known after their parent rays have hit and the corresponding
+surface points are available, so they can be batched in later waves.
+Reflection rays have an additional dependency: each reflected direction is
+known only after its parent hit has been shaded. A wavefront implementation
+can still batch rays at each stage, but cannot submit every ray at the start.
+
+5.4 Architecture
+----------------
+
+        AXI-Lite / CSR                    +---------------------------+
+        scene load, epsilon  ------------>|  sphere and halfspace     |
+                                          |  registers (7 x 4 x 64b)  |
+                                          +------------+--------------+
+                                                       |
+   req_valid/ready   +-------------------+             v
+   ray origin,       |   control FSM     |    +------------------+
+   direction, mode ->|  per object:      |--->|   datapath       |
+                     |  sub -> dot ->    |    |  3 x fp64 mul    |
+                     |  disc -> sqrt     |    |  1 x fp64 addsub |
+                     |  or halfspace div |    |  1 x fp64 sqrt   |
+                     +---------+---------+    |  1 x fp64 div    |
+                               |              |  fp64 compare    |
+                               v              +--------+---------+
+                     +-------------------+             |
+                     | nearest-hit /     |<------------+
+                     | any-hit selector  |
+                     |  best_t, best_obj |
+                     +---------+---------+
+                               |
+                               v
+                     res_valid/ready, res_hit, res_obj, res_t
+
+The objects are tested one at a time through shared arithmetic units. The
+square-root unit is used only when a sphere discriminant is non-negative,
+which occurs for about 4% of sphere tests, so most objects leave the datapath
+after the sign test. The divider is activated only if the scan reaches the
+halfspace and therefore runs at most once per ray; in any-hit mode an earlier
+sphere hit may end the scan before it gets there.
+
+Implementation: raytrace/hw/ray_scene_isect.sv (SystemVerilog, about 330
+lines) with the arithmetic units in fp64_units.sv. The FSM, the scene storage
+and the datapath connections are written in synthesizable style. The binary64
+operators are behavioural simulation models standing for vendor IP: they use
+$bitstoreal, $realtobits and $sqrt, which are not synthesizable, and present
+the valid/latency interface of a real core (modelled as 3 cycles for multiply
+and add, 8 for the square root, 10 for the divider). Synthesis would replace
+each model with a configured IP instance.
+
+Verification: raytrace/hw/tb_ray_scene_isect.sv runs 300 rays captured from an
+actual render - 160 in nearest mode and 140 shadow rays - together with the
+result the Python code computed for each (gen_vectors.py). The testbench
+requires an exact match of hit, object id and the 64-bit t. All 300 match. This
+is evidence of equivalence for this scene, not a proof for every possible
+input or IP configuration.
+
+5.5 Hardware/software interface
+-------------------------------
+Software loads the scene once per image: seven sphere writes, one halfspace
+write and the epsilon value. Thereafter, the two call sites change as follows:
+
+  - in rayColour(), the loop over scene objects is replaced by one request in
+    MODE_NEAREST; the returned object id indexes the existing Python list of
+    (object, surface) pairs, so the shading code is unchanged;
+  - in _lightIsVisible(), the loop is replaced by one request in MODE_ANYHIT,
+    and the returned hit flag is the answer.
+
+Everything else - shading, reflection, the canvas - stays in Python. A C
+extension or ctypes wrapper would submit rays and read results; with FIFOs, a
+batch of primary or shadow rays can be submitted before any result is read.
+
+5.6 Expected performance
+------------------------
+Two designs have to be distinguished here, because the implemented one
+demonstrates the function while a pipelined variant would provide the
+throughput.
+
+Implemented design (measured in simulation)
+  The testbench reports 388 cycles per ray on average and 423 in the worst
+  case. The units are shared, so each object waits out the latency of a chain
+  of dependent operations, and the eight objects are tested one after another.
+  At 100 MHz that is 3.88 us per ray, or about 101 ms for the 25,999 rays of
+  one image. The software region it replaces - intersection testing and the
+  scans around it, roughly half of the optimized 283.8 ms - costs about
+  142 ms. The image would then take roughly 142 + 101 = 243 ms, about 1.17x
+  faster than software alone, before any transfer cost. The implemented design
+  therefore provides only a modest theoretical gain. Driver and transfer
+  overhead could reduce or eliminate that gain, so its primary purpose is to
+  demonstrate the complete function and interface.
+
+Pipelined variant (estimated)
+  The eight object tests of a ray are independent, and so are the rays. A
+  datapath that accepts one object per cycle would test a whole scene in 8
+  cycles plus a fixed pipeline depth of roughly 30 cycles, and successive rays
+  would overlap, giving an effective 8 to 40 cycles per ray. For 25,999 rays
+  that is 2 to 10 ms, a stage speedup of 14x to 70x over the 142 ms of
+  software. Amdahl's law then bounds the result:
+
+      P = 0.5 (the accelerated half of the runtime)
+      S = 1 / (0.5 + 0.5/14) = 1.87x       (conservative, 40 cycles/ray)
+      S = 1 / (0.5 + 0.5/70) = 1.97x       (optimistic, 8 cycles/ray)
+      S_max = 1 / (1 - 0.5) = 2.0x         (if the stage were free)
+
+  283.8 ms would become roughly 145 to 152 ms. Accepting one object per
+  cycle requires enough multipliers and adders for the different arithmetic
+  stages to operate concurrently, together with fully pipelined square-root
+  and comparison units.
+
+Both figures exclude driver and transfer overhead. With one ray per interface
+crossing and 25,999 crossings per image, even 1 us of overhead per ray would
+add 26 ms, which is why the FIFO batching of 5.3 is part of the proposal
+rather than an optional extra.
+
+5.7 Trade-offs
+--------------
+Area. The implemented design uses three binary64 multipliers, one
+adder/subtracter, one square root, one divider and 7 x 4 x 64 bits of scene
+registers. Double-precision units are large, and the square root and divider
+are the largest of them; sharing them across objects is what keeps the design
+small. The pipelined variant needs enough multipliers and adders for its
+stages to run concurrently, with fully pipelined square-root and comparison
+units. An eight-lane design that tests the entire scene simultaneously would
+replicate the complete object datapath and add a nearest-hit reduction tree.
+
+Frequency. The critical path lies inside the floating-point units, so the
+achievable clock is essentially the one the chosen IP supports; 100 MHz is a
+conservative assumption for binary64 units on an FPGA.
+
+Power. About 96% of sphere tests end at the sign of the discriminant, so the
+square-root unit is idle for most objects and the divider runs once per ray.
+Skipping those stages on a miss is the main energy saving available, and it
+comes from the structure of the workload rather than from any circuit
+technique.
+
+Precision. binary32 or fixed-point units would be substantially smaller and
+faster, but their different rounding could change intersection decisions and
+pixels. The project's equivalence requirement (Section 3) rules them out; a
+renderer whose output only has to look correct could use them.
+
+Parallelism. Unlike the inverse BWT of the pyflate report, whose walk is
+inherently sequential, this workload is highly parallel: rays are
+independent, and within a ray the object tests are independent, needing only
+a final reduction to the nearest hit. The limit here
+is not the algorithm but area and interface bandwidth, and Amdahl's law: with
+half the runtime outside the accelerator, no amount of parallelism passes 2x.
+
+
+================================================================================
+6. CONCLUSION
+================================================================================
+
+raytrace renders a small scene with a ray tracer written entirely in Python,
+so it measures the interpreter executing vector arithmetic on small objects.
+Its cost profile is the opposite of pyflate's. Where pyflate was dominated by
+bit manipulation and per-byte loops, and a single line accounted for 17% of
+its runtime, raytrace spreads its time across many cheap operations: one image
+requires 3.09 million Python function calls and 556,460 temporary Vector, Ray
+and Point objects, and no single function exceeded 17% of self time.
+
+Profiling confirmed most of the expectations formed from reading the code and
+corrected their ranking. Vector arithmetic and object construction together
+accounted for about half of sampled self time, two type checks that compute
+nothing (mustBeVector and isPoint) for about 8%, and intersection testing for
+37.5% including callees, with 96% of sphere tests ending in the miss path.
+
+Five cumulative optimizations were applied, each verified against the
+original image by MD5 digest before it was measured, because the benchmark
+does not check its own output. The incremental reduction produced by each
+step, relative to the preceding version, was:
+
+  slots and removal of no-op type checks                          16.7%
+  inlined intersection and normalization arithmetic               27.2%
+  nearest-hit tracking and shadow-ray construction                31.8%
+  per-pixel loop and canvas writes                                 6.7%
+  inlined shading helpers                                          7.8%
+
+Together they reduce the mean from 798.6 ms to 283.8 ms, a 64.5% reduction or
+a 2.81x speedup, against a project requirement of 7%, with the output
+unchanged at every step.
+
+The largest saving did not come from the largest cost centre. _lightIsVisible
+constructed the same shadow ray repeatedly inside its loop over scene
+objects, so moving that construction out of the loop removed 72,173 Ray
+objects per image. The profile pointed at the line; understanding why it was
+expensive required reading the code. Throughout, inlined arithmetic kept the
+original evaluation order, since a rearranged floating-point expression could
+change an intersection decision and therefore a pixel.
+
+After optimization the remaining time is concentrated rather than spread:
+intersectionTime alone accounts for 38.2% of sampled self time, now performing
+the coordinate arithmetic directly without temporary Vector objects. The
+individual object-intersection calculations are independent, although their
+results must still be reduced to the nearest hit or examined in scene order
+for an any-hit query, which makes the search well suited to hardware. The proposed accelerator
+takes a whole ray and returns the selected hit for the whole scene, which
+reduces host interactions from 204,958 intersection tests to 25,999 rays. It
+uses binary64 arithmetic in the benchmark's evaluation order, and its
+behavioural simulation matched the Python reference bit for bit on 300
+captured rays in both of its modes.
+
+The implemented design shares its arithmetic units and needs 388 simulated
+cycles per ray. At the assumed 100 MHz, this gives an estimated overall
+speedup of about 1.17x before communication overhead; the real gain could be
+smaller. It demonstrates the function and the interface rather than the
+performance. A pipelined variant accepting one object per cycle would need an
+estimated 8 to 40 cycles per ray and approach 1.9x, close to the 2.0x ceiling
+that Amdahl's law sets when half of the runtime stays in software.
+
+Compared with pyflate, the two benchmarks reached almost the same software
+result, 2.83x and 2.81x, from entirely different optimizations, and their
+accelerators sit at opposite ends of the design space. pyflate's inverse-BWT
+walk is sequential and memory-bound, because every address depends on the
+result of the previous memory access. raytrace's object-intersection
+calculations are arithmetic and independent of one another, needing only a
+final reduction, so its accelerator is limited by area and interface
+bandwidth. In both proposals, accelerating the
+selected component eventually exposes the unaccelerated part of the
+application, making Amdahl's law the fundamental limit on further overall
+speedup.
