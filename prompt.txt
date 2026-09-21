@@ -1,0 +1,296 @@
+HWSW PROJECT - AI TOOL PROMPT LOG
+=================================
+
+AI tool used: Claude (Anthropic)/ ChatGPT 
+
+Disclosure
+----------
+This file documents the material prompts and instructions used during the
+project. The prompts below are reconstructed from the project conversation and
+lightly edited for clarity; they are not presented as a verbatim export of the
+chat. AI was used to explain benchmark code, draft instrumentation and
+optimization code, review reports, and draft hardware RTL and verification
+code. All performance numbers in the reports came from scripts run on the
+course VM. The generated code was reviewed, tested, profiled, and modified by us.
+AI suggestions that were incorrect or slower were rejected
+or corrected after testing.
+
+Some optimization ideas and the code drafts came from the AI, based on our
+profiling results. We reviewed each suggestion, verified
+output equivalence, measured each change on the course VM, and corrected or
+rejected suggestions that were wrong or slower. Changes were measured
+cumulatively.
+
+
+
+1. PROJECT REQUIREMENTS AND BENCHMARK SELECTION
+===============================================
+
+Prompt 1 - Select benchmarks
+----------------------------
+Compare raytrace, nbody, and pyflate as possible pyperformance benchmarks for a
+final hardware/software project. Discuss difficulty, optimization potential,
+profiling value, and possible hardware accelerators. I prefer challenging
+benchmarks rather than the safest choice.
+
+
+2. PYFLATE ANALYSIS AND MEASUREMENT
+===================================
+
+Prompt 2 - Explain pyflate
+--------------------------
+Review the supplied pyflate source and explain what the benchmark does in
+simple words. Identify which decompression path is executed by the supplied
+BZh9 input, which code is unused, and what work is inside the timed region.
+
+Prompt 3 - Characterize the workload
+------------------------------------
+Write an instrumentation script for the unmodified pyflate benchmark that
+counts input and output bytes, blocks, Huffman groups and symbols, selector
+count, table entries examined, move-to-front operations, bit-reader refills,
+inverse-BWT steps, and RLE output. Do not alter the timed benchmark. Print the
+values so they can be copied into Section 1.2 of the report.
+
+Prompt 4 - Explain the algorithms
+---------------------------------
+Explain the pyflate bzip2 decoder one stage at a time: MSB-first bit reading,
+headers, used-symbol map, selectors, delta-coded code lengths, canonical
+Huffman codes, Huffman decoding, RUNA/RUNB, inverse move-to-front, inverse BWT,
+and final RLE1 expansion. Keep the explanations understandable but technically
+accurate enough for a report.
+
+Prompt 5 - Benchmark and profiling script
+-----------------------------------------
+Draft script_pyflate.sh to set up dependencies, run a rigorous pyperformance
+baseline, save JSON and statistics, run cProfile, collect Linux perf cpu-clock
+samples with python3-dbg, generate a native flame graph, and generate a Python
+flame graph with py-spy. Keep the original and optimized benchmark results in
+separate files and provide comparison commands.
+
+
+3. PYFLATE SOFTWARE OPTIMIZATIONS
+=================================
+
+Prompt 6 - Move-to-front optimization
+-------------------------------------
+Profiling shows that move_to_front() is called 92,803 times and rebuilds the
+list using slices and concatenation. Suggest a behavior-preserving replacement,
+explain why it is equivalent, and explain how to measure it independently.
+
+Prompt 7 - Bit-reader optimization
+----------------------------------
+After optimizing move-to-front, review the new profile and inspect RBitfield
+and find_next_symbol(), which remain part of the largest cost centre. Identify
+unnecessary Python calls or repeated work in the bit-reading and Huffman
+decoding path, and propose a testable optimization. Preserve the exact
+bitstream position and verify the result using the expected MD5 digest.
+
+Prompt 8 - Huffman lookup optimization
+--------------------------------------
+Huffman decoding is still the largest cost after the bit-reader changes.
+Propose a faster decoding method, explain why it produces the same symbols,
+and estimate its memory cost.
+
+Prompt 9 - RLE1 optimization
+-----------------------------
+After the Huffman optimization, re-profile the benchmark. The final RLE1
+expansion loop is now a major cost and scans the inverse-BWT output one byte
+at a time in Python. We think it may be faster to locate encoded runs and copy
+the unchanged regions between them in larger slices instead of appending one
+byte at a time. Propose an implementation of this idea or another suitable
+method. Preserve the exact run format, handle boundary and adjacent-run cases,
+and verify the result using the expected MD5 digest.
+
+Prompt 10 - Inverse-BWT optimization
+------------------------------------
+After the RLE1 step, re-profile bwt_transform(). We observed that it sorts the
+entire block and then calls find() once for every possible byte value before
+building the position mapping. Investigate whether the same mapping can be
+constructed more efficiently by grouping or counting byte positions. Compare
+the proposed method with reasonable alternatives, keep bwt_reverse() unchanged,
+and verify that the output and expected MD5 digest remain identical.
+
+
+4. PYFLATE HARDWARE PROPOSAL
+============================
+
+Prompt 11 - Choose a hardware component
+---------------------------------------
+Using the final optimized profile, identify a significant remaining component
+that is suitable for hardware acceleration. Compare the strongest candidates
+in terms of runtime share, computation pattern, software/hardware interface,
+parallelism and data-transfer overhead.
+
+Prompt 12 - Inverse-BWT RTL and testbench
+-----------------------------------------
+We decided to accelerate inverse BWT. Design a SystemVerilog accelerator that
+accepts the BWT block, its length and origPtr and returns the reconstructed
+block. Derive the datapath and control phases from the Python bwt_transform()
+and bwt_reverse() functions. Use valid/ready handshakes and preserve the exact
+software behavior.
+
+Also write a testbench that compares the hardware output with known software
+results and includes normal text, repeated and periodic inputs, and output
+backpressure. Explain the memory requirements, expected cycle count, FPGA
+memory-latency assumptions, and performance/area trade-offs.
+
+
+5. RAYTRACE ANALYSIS AND CORRECTNESS
+====================================
+
+Prompt 13 - Compare raytrace with our previous homework
+----------------------------------
+Ray tracing was the subject of our first course homework. Compare
+bm_raytrace/run_benchmark.py with the ray tracer we implemented for HW1.
+Map the corresponding components, including the camera, primary rays, vectors
+and points, sphere and plane intersections, nearest-hit selection, lighting,
+shadow rays, reflections, and the checkerboard surface.
+
+Identify differences in equations, object representation, control flow and
+terminology. In particular, distinguish behavior specific to this Python
+benchmark from the general ray-tracing algorithm and from our previous
+implementation.
+
+Prompt 14 - Characterize the raytrace workload
+----------------------------------------------
+Write characterize_raytrace.py that instruments the original benchmark and
+counts primary, reflection, and shadow rays; sphere and halfspace intersection
+tests and hits; Vector, Point, and Ray constructions; dot, subtraction, scale,
+normalization, and magnitude calls. The script must not supply invented
+numbers: print values collected from one real 100 x 100 render for use in
+Section 1.2.
+
+Prompt 15 - Add an external correctness check
+---------------------------------------------
+The raytrace benchmark has no built-in output verification and normally writes
+no file. Write check_output.py that loads the original and optimized benchmark
+modules, renders the same 100 x 100 scene with each, writes deterministic PPM
+outputs, compares their sizes and MD5 digests, and exits with an error if any
+pixel differs. Keep correctness checking outside the timed benchmark.
+
+Prompt 16 - Raytrace profiling script
+-------------------------------------
+Draft script_raytrace.sh with setup, rigorous baseline, original profiling,
+optimized measurements, optimized profiling, and pyperf comparison stages.
+Collect cProfile, Linux perf with cpu-clock, native and py-spy flame graphs,
+and raw py-spy folded samples so self and inclusive time can be calculated.
+
+
+6. RAYTRACE SOFTWARE OPTIMIZATIONS
+==================================
+
+Prompt 17 - Slots and type checks
+---------------------------------
+Profiling shows hundreds of thousands of Vector/Point constructions and calls
+to mustBeVector() and isPoint(). Add appropriate __slots__ and remove redundant
+checks only on paths where the benchmark always supplies the correct type.
+Preserve the public behavior needed by the scene and verify the image before
+benchmarking.
+
+Prompt 18 - Inline geometry hot paths
+-------------------------------------
+Optimize Sphere.intersectionTime(), Halfspace.intersectionTime(), and
+Vector.normalized() by working directly on coordinates and avoiding temporary
+Vector objects and small method calls. Preserve the original arithmetic
+evaluation order exactly because the image must remain bit-identical.
+
+Prompt 19 - Nearest-hit and shadow rays
+---------------------------------------
+After the geometry changes, re-profile the optimized benchmark and inspect
+rayColour() and _lightIsVisible(), which remain expensive. Look for temporary
+intersection data or work that is repeated unnecessarily inside the object
+loops, and propose an optimization that reduces those costs.
+
+Preserve the original selection behavior: accept candidates with
+t > -EPSILON, retain the first object on an exact tie, and keep the existing
+any-hit rule used by the shadow test. Verify that the rendered image remains
+identical before measuring the change.
+
+Prompt 20 - Render loop and canvas
+----------------------------------
+Optimize the per-pixel render loop without changing pixel order or floating-
+point association. Consider local bindings for camera-vector components and
+hot methods, row-invariant expressions, removal of temporary vector additions,
+and reducing repeated self.bytes lookups in Canvas.plot(). Measure this as a
+separate cumulative step.
+
+Prompt 21 - Shading helpers
+---------------------------
+Inline the remaining hot vector operations in reflectThrough(), pointAtTime(),
+Sphere.normalAt(), and the diffuse-light calculation. Preserve the original
+order of floating-point operations and verify the PPM digest before measuring.
+
+
+7. RAYTRACE HARDWARE ACCELERATOR
+================================
+
+Prompt 22 - Select the accelerator boundary
+-------------------------------------------
+The final profile places 38.2% of self time in intersectionTime and additional
+time in the surrounding scans. Compare a dot-product unit, normalization unit,
+single ray-object unit, and a whole-scene intersection accelerator. Account for
+software/hardware interface crossings and choose the most useful boundary.
+
+Prompt 23 - Define modes and interface
+--------------------------------------
+For the chosen intersection accelerator, define its inputs, outputs, data
+widths, handshakes and assumed frequency, and how it must behave for the two
+places in the benchmark that search the scene.
+
+Prompt 24 - Generate RTL
+------------------------
+Write SystemVerilog for the ray/scene accelerator using shared binary64
+multiplier, add/subtract, square-root, divider, and comparison units. Preserve
+the benchmark's exact arithmetic order, skip square root on a negative
+discriminant, test objects in scene order, and hold results until a valid/ready
+handshake. Behavioral floating-point models may stand in for vendor IP, but
+identify them clearly as non-synthesizable simulation models.
+
+Prompt 25 - Generate reference vectors and verification
+-------------------------------------------------------
+Write a Python script that imports the original benchmark, captures real
+primary/reflection and shadow rays, and records the expected hit, object ID,
+and 64-bit intersection time. Write a SystemVerilog testbench that loads the
+scene and 300 captured rays, checks exact results in both modes, measures cycles
+per ray, exercises request/result handshakes, and reports every mismatch.
+
+Prompt 26 - Performance and trade-off analysis
+----------------------------------------------
+Using the simulated cycles per ray, 100 MHz assumption, 25,999 rays per image,
+and the optimized software time, estimate the implemented design's overall
+speedup. Separately estimate a one-object-per-cycle pipelined variant using
+Amdahl's law. Clearly distinguish measured software results, simulated cycle
+counts, and hypothetical hardware estimates, and discuss area, power,
+precision, interface bandwidth, and batching limitations.
+
+
+8. REPORT REVIEW
+================
+
+Prompt 27 - Review report sections
+----------------------------------
+Review each report section for technical accuracy and concise wording.
+
+Prompt 28 - Draft conclusions
+-----------------------------
+Draft concise conclusions for pyflate and raytrace that summarize the original
+bottlenecks, verified software improvements, remaining bottlenecks, hardware
+proposal, Amdahl limit, and the contrast between a sequential memory-dependent
+inverse-BWT walk and a parallel arithmetic intersection workload.
+
+
+Verification performed by us
+=============================
+
+- Ran every baseline and optimized measurement on the course VM using
+  pyperformance; AI did not generate the reported timing values.
+- Ran cProfile, py-spy, Linux perf, and flame-graph generation scripts.
+- Verified pyflate output using the benchmark's expected MD5 digest.
+- Verified every raytrace optimization using check_output.py and the original
+  rendered-image digest.
+- Compared each cumulative optimization step with the saved baseline using
+  pyperf compare_to.
+- Simulated the hardware testbenches and reviewed failures or mismatches before
+  using their results in the reports.
+- Retained the original benchmark sources and saved each optimized step for
+  comparison and reproduction.
