@@ -8,11 +8,11 @@ Input     : data/interpreter.tar.bz2
 
 Contents
   1. Overview
-  2. Initial Analysis                  (TODO)
-  3. Optimizations                     (TODO)
-  4. Performance Comparison            (TODO)
-  5. Hardware Acceleration Proposal    (TODO)
-  6. Conclusion                        (TODO)
+  2. Initial Analysis                  
+  3. Optimizations                     
+  4. Performance Comparison            
+  5. Hardware Acceleration Proposal    
+  6. Conclusion                        
 
 
 ================================================================================
