@@ -130,11 +130,20 @@ stage_setup() {
         rm -rf "$ORIG_DIR/__pycache__"
     fi
 
-    log "Creating the optimized copy (only if it does not exist yet)"
-    if [[ ! -d "$OPT_DIR" ]]; then
-        mkdir -p "$OPT_DIR"
+    log "Completing the optimized copy (never overwrites the optimized code)"
+    # A fresh clone already contains the optimized run_benchmark.py, so each
+    # missing piece is created separately rather than only when the whole
+    # directory is absent.
+    mkdir -p "$OPT_DIR"
+    if [[ ! -f "$OPT_DIR/run_benchmark.py" ]]; then
         cp "$ORIG_DIR/run_benchmark.py" "$OPT_DIR/"
+    fi
+    # The input archive is not committed with the optimized code, so a fresh
+    # clone needs it copied in even though run_benchmark.py already exists.
+    if [[ ! -d "$OPT_DIR/data" ]]; then
         cp -r "$ORIG_DIR/data" "$OPT_DIR/"
+    fi
+    if [[ ! -f "$OPT_DIR/pyproject.toml" ]]; then
         # The json result keeps the name "pyflate" (set in run_benchmark.py),
         # so baseline and optimized results can be compared directly.
         cat > "$OPT_DIR/pyproject.toml" <<'EOF'

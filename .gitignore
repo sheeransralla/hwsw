@@ -6,3 +6,7 @@ tools/FlameGraph/
 *.prof
 *.pyc
 __pycache__/
+raytrace/bm_raytrace/
+raytrace/venv/
+pyflate/bm_pyflate_opt/data/
+*.tar.gz
