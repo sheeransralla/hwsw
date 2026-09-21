@@ -1122,14 +1122,3 @@ performance. A pipelined variant accepting one object per cycle would need an
 estimated 8 to 40 cycles per ray and approach 1.9x, close to the 2.0x ceiling
 that Amdahl's law sets when half of the runtime stays in software.
 
-Compared with pyflate, the two benchmarks reached almost the same software
-result, 2.83x and 2.81x, from entirely different optimizations, and their
-accelerators sit at opposite ends of the design space. pyflate's inverse-BWT
-walk is sequential and memory-bound, because every address depends on the
-result of the previous memory access. raytrace's object-intersection
-calculations are arithmetic and independent of one another, needing only a
-final reduction, so its accelerator is limited by area and interface
-bandwidth. In both proposals, accelerating the
-selected component eventually exposes the unaccelerated part of the
-application, making Amdahl's law the fundamental limit on further overall
-speedup.
